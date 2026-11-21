@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 #
 # Download.sh
-# Linux replacement for the Windows-only Downloads.bat.
-# Intended for Ubuntu 24.04 inside the remote Linux container.
+# Linux setup script for the Ubuntu 24.04 remote container.
 #
 set -Eeuo pipefail
 
@@ -15,14 +14,6 @@ fail() {
   exit 1
 }
 
-if [[ "$(id -u)" -eq 0 ]]; then
-  SUDO=()
-elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-  SUDO=(sudo -n)
-else
-  fail "This script needs root or passwordless sudo to install packages."
-fi
-
 if [[ ! -r /etc/os-release ]]; then
   fail "Cannot identify the Linux distribution."
 fi
@@ -33,14 +24,26 @@ if [[ "${ID:-}" != "ubuntu" ]]; then
   fail "This script is designed for Ubuntu; detected: ${PRETTY_NAME:-unknown}."
 fi
 
+if [[ "$(id -u)" -eq 0 ]]; then
+  apt_install() {
+    DEBIAN_FRONTEND=noninteractive apt-get "$@"
+  }
+elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+  apt_install() {
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get "$@"
+  }
+else
+  fail "This script needs root or passwordless sudo to install packages."
+fi
+
 log "Preparing user directories..."
 mkdir -p "$HOME/Downloads" "$HOME/Projects" "$HOME/.local/bin"
 
 log "Updating Ubuntu package indexes..."
-"${SUDO[@]}" apt-get update
+apt_install update
 
-log "Installing Linux development and desktop-support utilities..."
-"${SUDO[@]}" DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+log "Installing development and terminal utilities..."
+apt_install install -y --no-install-recommends \
   zsh \
   fish \
   ripgrep \
@@ -80,4 +83,4 @@ done
 
 log "Linux setup completed."
 log "Directories: $HOME/Downloads and $HOME/Projects"
-log "Note: This is a headless SSH container; Windows installers, .bat files, PowerShell scripts, and GUI-only setup tools are intentionally not run."
+log "This is a headless SSH container; GUI-only and Windows-only installers are not run."
