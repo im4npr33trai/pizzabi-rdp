@@ -1,4 +1,4 @@
-name: Ubuntu Linux + Tailscale + SSH + Download.sh
+name: Ubuntu Linux Desktop + Tailscale + SSH + RDP
 
 on:
   workflow_dispatch:
@@ -118,9 +118,10 @@ jobs:
             ubuntu:24.04 \
             sleep infinity
 
-      - name: Install Linux Tools and Configure SSH
+      - name: Install Linux Tools, XFCE Desktop, SSH and RDP
         env:
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           set -euo pipefail
 
@@ -131,6 +132,11 @@ jobs:
             apt-get update
             apt-get install -y --no-install-recommends \
               openssh-server \
+              xrdp \
+              xorgxrdp \
+              xfce4 \
+              xfce4-goodies \
+              dbus-x11 \
               sudo \
               ca-certificates \
               curl \
@@ -159,15 +165,18 @@ jobs:
 
             id remote >/dev/null 2>&1 || useradd --create-home --shell /bin/bash remote
             usermod -aG sudo remote
-            passwd --lock remote
+            adduser xrdp ssl-cert || true
 
             printf "%s\\n" "remote ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/remote
             chmod 0440 /etc/sudoers.d/remote
             visudo -cf /etc/sudoers.d/remote
 
-            mkdir -p /run/sshd /workspace /home/remote/.ssh
+            mkdir -p /run/sshd /run/xrdp /workspace /home/remote/.ssh
             chown -R remote:remote /workspace /home/remote/.ssh
             chmod 700 /home/remote/.ssh
+            printf '%s\\n' 'startxfce4' > /home/remote/.xsession
+            chown remote:remote /home/remote/.xsession
+            chmod 600 /home/remote/.xsession
             ssh-keygen -A
           '
 
@@ -179,6 +188,15 @@ jobs:
 
           printf '%s\n' "$SSH_PUBLIC_KEY" |
             docker exec -i linux-remote tee /home/remote/.ssh/authorized_keys >/dev/null
+
+          # Set the desktop password from a GitHub Actions secret without logging it.
+          if [ -z "${RDP_PASSWORD//[[:space:]]/}" ]; then
+            echo "Missing repository secret: RDP_PASSWORD"
+            exit 1
+          fi
+
+          printf 'remote:%s\\n' "$RDP_PASSWORD" |
+            docker exec -i linux-remote chpasswd
 
           docker exec linux-remote bash -c '
             chown remote:remote /home/remote/.ssh/authorized_keys
@@ -205,6 +223,10 @@ jobs:
 
           docker exec -d linux-remote /usr/sbin/sshd -D -e
 
+          # Start the XFCE desktop's RDP services inside the Ubuntu container.
+          docker exec linux-remote service xrdp-sesman start
+          docker exec linux-remote service xrdp start
+
       - name: Copy and Run Linux Download.sh
         run: |
           set -euo pipefail
@@ -220,7 +242,7 @@ jobs:
 
           docker exec linux-remote su - remote -c "bash /home/remote/Download.sh"
 
-      - name: Verify SSH Accessibility
+      - name: Verify SSH and RDP Accessibility
         run: |
           set -euo pipefail
 
@@ -242,6 +264,24 @@ jobs:
           docker logs linux-remote || true
           exit 1
 
+          echo "Checking RDP on $TS_IP:3389"
+          for attempt in $(seq 1 30); do
+            if nc -z -w 3 "$TS_IP" 3389; then
+              echo "RDP port 3389 is reachable."
+              break
+            fi
+            echo "Waiting for xRDP ($attempt/30)..."
+            sleep 3
+          done
+
+          if ! nc -z -w 3 "$TS_IP" 3389; then
+            echo "RDP port 3389 is not reachable."
+            docker exec linux-remote service xrdp status || true
+            docker exec linux-remote service xrdp-sesman status || true
+            docker logs linux-remote || true
+            exit 1
+          fi
+
       - name: Maintain Remote Linux Session
         run: |
           set -euo pipefail
@@ -254,11 +294,19 @@ jobs:
           echo "========================================"
           echo "Tailscale IP: $TS_IP"
           echo "SSH Port:     2222"
+          echo "RDP Port:     3389"
           echo "Username:     remote"
+          echo "RDP Password: stored in GitHub secret RDP_PASSWORD (not printed)"
           echo "Workspace:    /workspace"
           echo
-          echo "Connect from your own machine with:"
+          echo "SSH connection:"
           echo "ssh -p 2222 remote@$TS_IP"
+          echo
+          echo "Remmina connection:"
+          echo "Protocol: RDP"
+          echo "Server:   $TS_IP:3389"
+          echo "Username: remote"
+          echo "Password: value stored in GitHub secret RDP_PASSWORD"
           echo "========================================"
           echo
 
