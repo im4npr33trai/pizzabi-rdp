@@ -90,8 +90,8 @@ jobs:
       - name: Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
-          oauth-client-id: "REPLACE_WITH_TAILSCALE_FEDERATED_CLIENT_ID"
-          audience: "REPLACE_WITH_TAILSCALE_FEDERATED_AUDIENCE"
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
           tags: "tag:github-actions"
           version: latest
 
@@ -121,6 +121,8 @@ jobs:
             sleep infinity
 
       - name: Install Linux Tools and Configure SSH
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
           set -euo pipefail
 
@@ -172,10 +174,8 @@ jobs:
           '
 
           # This is a PUBLIC key. Never put your private key in this file.
-          SSH_PUBLIC_KEY="ssh-ed25519 REPLACE_WITH_YOUR_PUBLIC_KEY"
-
-          if [[ "$SSH_PUBLIC_KEY" == *"REPLACE_WITH_YOUR_PUBLIC_KEY"* ]]; then
-            echo "Replace the SSH public-key placeholder in this workflow before running."
+          if [ -z "${SSH_PUBLIC_KEY//[[:space:]]/}" ]; then
+            echo "Missing repository secret: SSH_PUBLIC_KEY"
             exit 1
           fi
 
