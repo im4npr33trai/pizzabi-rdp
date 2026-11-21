@@ -1,133 +1,313 @@
-name: win 11 + tailscale + Download.bat script
+name: Ubuntu Linux + Tailscale + SSH + Download.sh
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+concurrency:
+  group: ubuntu-remote-session
+  cancel-in-progress: false
+
 jobs:
-  secure-rdp:
-    runs-on: windows-2022
+  secure-ssh:
+    runs-on: ubuntu-24.04
     timeout-minutes: 350
 
     steps:
-      - name: Configure Core RDP Settings
-        run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+      # Restore the latest successful workspace artifact from this workflow.
+      - name: Find Previous Workspace Snapshot
+        id: previous
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "arch-remote.yml",
+              branch: "Singh",
+              status: "completed",
+              per_page: 50
+            });
 
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User with Fixed Password
-        run: |
-          $password = "MR.English2008"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          }
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
-
-      - name: Install Tailscale
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-
-      - name: Establish Tailscale Connection
-        run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
-
-      - name: Maintain Connection + Watch RDP User
-        run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
-
-          $rdpProfile = "C:\Users\RDP"
-          $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
-          $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
-          $downloadPath = "$startupPath\Downloads.bat"
-
-          while ($true) {
-              if (Test-Path $rdpProfile) {
-                  try {
-                      if (-not (Test-Path $startupPath)) {
-                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
-                      }
-
-                      Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
-                      Write-Host "✅ Downloads.bat copied to $downloadPath"
-
-                      # Run the batch file for the first time
-                      cmd /c $downloadPath
-                      Write-Host "✅ Downloads.bat executed successfully"
-                      break
-                  }
-                  catch {
-                      Write-Host "❌ Error copying or executing Downloads.bat: $($_.Exception.Message)"
-                      break
-                  }
+            for (const run of runs.data.workflow_runs) {
+              if (run.id === context.runId || run.conclusion !== "success") {
+                continue;
               }
-              else {
-                  Write-Host "[$(Get-Date)] Waiting for RDP profile to be created..."
-                  Start-Sleep -Seconds 30
-              }
-          }
 
-          # Keep runner alive
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
-          }
+              const response = await github.rest.actions.listWorkflowRunArtifacts({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run.id
+              });
+
+              const artifact = response.data.artifacts.find(
+                item => item.name === "linux-remote-workspace" && !item.expired
+              );
+
+              if (artifact) {
+                core.setOutput("run_id", String(run.id));
+                console.log("Found workspace snapshot from run:", run.id);
+                return;
+              }
+            }
+
+            core.setOutput("run_id", "");
+            console.log("No previous workspace snapshot found.");
+
+      - name: Prepare Workspace Directory
+        run: |
+          mkdir -p "$RUNNER_TEMP/remote-workspace"
+
+      - name: Download Previous Workspace
+        if: steps.previous.outputs.run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-remote-workspace
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.previous.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/workspace-restore
+
+      - name: Restore Previous Workspace
+        if: steps.previous.outputs.run_id != ''
+        run: |
+          if [ -f "$RUNNER_TEMP/workspace-restore/workspace.tar.gz" ]; then
+            tar -xzf "$RUNNER_TEMP/workspace-restore/workspace.tar.gz" \
+              -C "$RUNNER_TEMP/remote-workspace"
+            echo "Previous workspace restored."
+          else
+            echo "No workspace archive was present in the downloaded artifact."
+          fi
+
+      # Tailscale OIDC federation: these two values are identifiers, not secrets.
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: "REPLACE_WITH_TAILSCALE_FEDERATED_CLIENT_ID"
+          audience: "REPLACE_WITH_TAILSCALE_FEDERATED_AUDIENCE"
+          tags: "tag:github-actions"
+          version: latest
+
+      - name: Verify Tailscale Connection
+        run: |
+          TS_IP="$(tailscale ip -4 | head -n 1)"
+
+          if [ -z "$TS_IP" ]; then
+            echo "Tailscale did not assign an IPv4 address."
+            exit 1
+          fi
+
+          echo "Tailscale connection established."
+          echo "Tailscale IPv4: $TS_IP"
+
+      - name: Start Ubuntu 24.04 Container
+        run: |
+          docker pull ubuntu:24.04
+          docker rm -f linux-remote 2>/dev/null || true
+
+          docker run -d \
+            --name linux-remote \
+            --network host \
+            --restart=no \
+            --volume "$RUNNER_TEMP/remote-workspace:/workspace" \
+            ubuntu:24.04 \
+            sleep infinity
+
+      - name: Install Linux Tools and Configure SSH
+        run: |
+          set -euo pipefail
+
+          docker exec linux-remote bash -c '
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              openssh-server \
+              sudo \
+              ca-certificates \
+              curl \
+              wget \
+              git \
+              build-essential \
+              pkg-config \
+              vim \
+              nano \
+              tmux \
+              htop \
+              unzip \
+              zip \
+              jq \
+              procps \
+              iproute2 \
+              iputils-ping \
+              netcat-openbsd \
+              python3 \
+              python3-pip \
+              python3-venv \
+              bash-completion \
+              file \
+              xz-utils \
+              zstd
+
+            id remote >/dev/null 2>&1 || useradd --create-home --shell /bin/bash remote
+            usermod -aG sudo remote
+            passwd --lock remote
+
+            printf "%s\\n" "remote ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/remote
+            chmod 0440 /etc/sudoers.d/remote
+            visudo -cf /etc/sudoers.d/remote
+
+            mkdir -p /run/sshd /workspace /home/remote/.ssh
+            chown -R remote:remote /workspace /home/remote/.ssh
+            chmod 700 /home/remote/.ssh
+            ssh-keygen -A
+          '
+
+          # This is a PUBLIC key. Never put your private key in this file.
+          SSH_PUBLIC_KEY="ssh-ed25519 REPLACE_WITH_YOUR_PUBLIC_KEY"
+
+          if [[ "$SSH_PUBLIC_KEY" == *"REPLACE_WITH_YOUR_PUBLIC_KEY"* ]]; then
+            echo "Replace the SSH public-key placeholder in this workflow before running."
+            exit 1
+          fi
+
+          printf '%s\n' "$SSH_PUBLIC_KEY" |
+            docker exec -i linux-remote tee /home/remote/.ssh/authorized_keys >/dev/null
+
+          docker exec linux-remote bash -c '
+            chown remote:remote /home/remote/.ssh/authorized_keys
+            chmod 600 /home/remote/.ssh/authorized_keys
+
+            cat > /etc/ssh/sshd_config <<EOF
+          Port 2222
+          AddressFamily any
+          ListenAddress 0.0.0.0
+          PermitRootLogin no
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          UsePAM yes
+          AllowUsers remote
+          X11Forwarding no
+          AllowTcpForwarding yes
+          PermitTunnel no
+          Subsystem sftp /usr/lib/openssh/sftp-server
+          EOF
+
+            sshd -t
+          '
+
+          docker exec -d linux-remote /usr/sbin/sshd -D -e
+
+      - name: Download and Run Linux Download.sh
+        run: |
+          set -euo pipefail
+
+          DOWNLOAD_URL="REPLACE_WITH_DIRECT_URL_TO_YOUR_LINUX_Download.sh"
+
+          if [[ "$DOWNLOAD_URL" == *"REPLACE_WITH_DIRECT_URL"* ]]; then
+            echo "Replace DOWNLOAD_URL with the direct URL of a Linux shell script."
+            exit 1
+          fi
+
+          docker exec linux-remote curl --fail --location --show-error \
+            "$DOWNLOAD_URL" --output /home/remote/Download.sh
+
+          docker exec linux-remote chown remote:remote /home/remote/Download.sh
+          docker exec linux-remote chmod 700 /home/remote/Download.sh
+
+          docker exec linux-remote su - remote -c "bash /home/remote/Download.sh"
+
+      - name: Verify SSH Accessibility
+        run: |
+          set -euo pipefail
+
+          TS_IP="$(tailscale ip -4 | head -n 1)"
+
+          echo "Checking SSH on $TS_IP:2222"
+
+          for attempt in $(seq 1 20); do
+            if nc -z -w 3 "$TS_IP" 2222; then
+              echo "SSH port 2222 is reachable."
+              exit 0
+            fi
+
+            echo "Waiting for SSH server ($attempt/20)..."
+            sleep 3
+          done
+
+          echo "SSH port 2222 is not reachable."
+          docker logs linux-remote || true
+          exit 1
+
+      - name: Maintain Remote Linux Session
+        run: |
+          set -euo pipefail
+
+          TS_IP="$(tailscale ip -4 | head -n 1)"
+
+          echo
+          echo "========================================"
+          echo "UBUNTU 24.04 REMOTE LINUX"
+          echo "========================================"
+          echo "Tailscale IP: $TS_IP"
+          echo "SSH Port:     2222"
+          echo "Username:     remote"
+          echo "Workspace:    /workspace"
+          echo
+          echo "Connect from your own machine with:"
+          echo "ssh -p 2222 remote@$TS_IP"
+          echo "========================================"
+          echo
+
+          while true; do
+            if [ "$(docker inspect -f '{{.State.Running}}' linux-remote 2>/dev/null)" != "true" ]; then
+              echo "Remote container stopped unexpectedly."
+              docker logs linux-remote || true
+              exit 1
+            fi
+
+            echo "[$(date -Is)] Ubuntu remote session is running."
+            sleep 300
+          done
+
+      # These always() steps run when the session is cancelled or times out.
+      - name: Create Workspace Snapshot
+        id: snapshot
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [ ! -d "$RUNNER_TEMP/remote-workspace" ]; then
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          tar -czf "$RUNNER_TEMP/workspace.tar.gz" \
+            -C "$RUNNER_TEMP/remote-workspace" .
+
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Workspace Artifact
+        if: always() && steps.snapshot.outputs.created == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-remote-workspace
+          path: ${{ runner.temp }}/workspace.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Cleanup Ubuntu Container
+        if: always()
+        run: |
+          docker rm -f linux-remote 2>/dev/null || true
+          echo "Ubuntu container removed."
