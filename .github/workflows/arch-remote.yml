@@ -1,0 +1,363 @@
+name: Linux Remote SSH Environment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+concurrency:
+  group: linux-remote-ssh
+  cancel-in-progress: false
+
+jobs:
+  remote:
+    name: Linux Remote Environment
+
+    runs-on: ubuntu-24.04
+
+    timeout-minutes: 350
+
+    steps:
+      # -----------------------------------------
+      # 1. Checkout
+      # -----------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------
+      # 2. Connect Tailscale
+      # -----------------------------------------
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:github-actions
+
+      # -----------------------------------------
+      # 3. Obtain Tailscale IP
+      # -----------------------------------------
+
+      - name: Get Tailscale address
+        id: network
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          TS_IP="$(tailscale ip -4 | head -n 1)"
+
+          if [[ ! "$TS_IP" =~ ^100\. ]]; then
+            echo "Invalid Tailscale IPv4 address."
+            exit 1
+          fi
+
+          echo "Tailscale IP: $TS_IP"
+          echo "ip=$TS_IP" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------
+      # 4. Validate SSH public key
+      # -----------------------------------------
+
+      - name: Validate SSH public key
+        shell: bash
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "$SSH_PUBLIC_KEY" ]]; then
+            echo "SSH_PUBLIC_KEY secret is missing."
+            exit 1
+          fi
+
+          if [[ "$SSH_PUBLIC_KEY" == *$'\n'* ]]; then
+            echo "Only one public key is supported."
+            exit 1
+          fi
+
+          KEY_FILE="$(mktemp)"
+          trap 'rm -f "$KEY_FILE"' EXIT
+
+          printf '%s\n' "$SSH_PUBLIC_KEY" > "$KEY_FILE"
+
+          if ! ssh-keygen -l -f "$KEY_FILE"; then
+            echo "Invalid SSH public key."
+            exit 1
+          fi
+
+      # -----------------------------------------
+      # 5. Prepare persistent workspace
+      # -----------------------------------------
+
+      - name: Prepare workspace
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p "$RUNNER_TEMP/remote-workspace"
+
+          echo "Workspace prepared."
+
+      # -----------------------------------------
+      # 6. Restore previous GitHub artifact
+      # -----------------------------------------
+
+      - name: Restore previous workspace
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          WORKSPACE="$RUNNER_TEMP/remote-workspace"
+
+          echo "Searching for previous workspace snapshots..."
+
+          mapfile -t RUN_IDS < <(
+            gh run list \
+              --workflow .github/workflows/linux-remote.yml \
+              --branch "$GITHUB_REF_NAME" \
+              --limit 20 \
+              --json databaseId,status \
+              --jq '.[] | select(.status == "completed") | .databaseId'
+          )
+
+          RESTORED=false
+
+          for RUN_ID in "${RUN_IDS[@]}"; do
+
+            CANDIDATE="$RUNNER_TEMP/restore-$RUN_ID"
+
+            mkdir -p "$CANDIDATE"
+
+            echo "Checking run: $RUN_ID"
+
+            if gh run download "$RUN_ID" \
+              --name linux-remote-workspace \
+              --dir "$CANDIDATE" >/dev/null 2>&1; then
+
+              ARCHIVE="$CANDIDATE/workspace.tar.gz"
+
+              if [[ -f "$ARCHIVE" ]]; then
+
+                if ! tar -tzf "$ARCHIVE" >/dev/null 2>&1; then
+                  echo "Invalid workspace archive."
+                  exit 1
+                fi
+
+                if tar -tzf "$ARCHIVE" | \
+                  grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+                  echo "Unsafe archive paths detected."
+                  exit 1
+                fi
+
+                tar \
+                  --no-same-owner \
+                  --no-same-permissions \
+                  -xzf "$ARCHIVE" \
+                  -C "$WORKSPACE"
+
+                echo "Workspace restored from run $RUN_ID"
+
+                RESTORED=true
+                break
+              fi
+            fi
+
+          done
+
+          if [[ "$RESTORED" == "false" ]]; then
+            echo "No previous workspace artifact found."
+            echo "Starting with an empty workspace."
+          fi
+
+      # -----------------------------------------
+      # 7. Build Linux Docker image
+      # -----------------------------------------
+
+      - name: Build Linux container
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          docker build \
+            --pull \
+            --tag linux-remote:local \
+            ./docker/linux
+
+      # -----------------------------------------
+      # 8. Start container
+      # -----------------------------------------
+
+      - name: Start Linux SSH environment
+        shell: bash
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+          TS_IP: ${{ steps.network.outputs.ip }}
+        run: |
+          set -Eeuo pipefail
+
+          docker run -d \
+            --name linux-remote \
+            --hostname linux-remote \
+            --init \
+            --cap-drop ALL \
+            --cap-add CHOWN \
+            --cap-add SETUID \
+            --cap-add SETGID \
+            --cap-add DAC_OVERRIDE \
+            --security-opt no-new-privileges:true \
+            --pids-limit 512 \
+            --memory 4g \
+            --cpus 2 \
+            --env SSH_PUBLIC_KEY \
+            --publish "${TS_IP}:2222:2222/tcp" \
+            --mount type=bind,src="$RUNNER_TEMP/remote-workspace",dst=/home/remote/workspace \
+            linux-remote:local
+
+          echo "Container started."
+
+      # -----------------------------------------
+      # 9. Verify SSH
+      # -----------------------------------------
+
+      - name: Verify SSH service
+        shell: bash
+        env:
+          TS_IP: ${{ steps.network.outputs.ip }}
+        run: |
+          set -Eeuo pipefail
+
+          for attempt in $(seq 1 30); do
+
+            if [[ "$(docker inspect -f '{{.State.Running}}' linux-remote)" == "true" ]] && \
+              timeout 3 bash -c \
+              "echo > /dev/tcp/$TS_IP/2222" 2>/dev/null; then
+
+              echo "SSH service is reachable."
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          docker logs linux-remote
+
+          echo "SSH startup failed."
+          exit 1
+
+      # -----------------------------------------
+      # 10. Display connection information
+      # -----------------------------------------
+
+      - name: Display SSH connection
+        shell: bash
+        env:
+          TS_IP: ${{ steps.network.outputs.ip }}
+        run: |
+          set -Eeuo pipefail
+
+          echo "======================================"
+          echo " LINUX REMOTE ENVIRONMENT"
+          echo "======================================"
+          echo ""
+          echo "Address: $TS_IP"
+          echo "Port: 2222"
+          echo "Username: remote"
+          echo ""
+          echo "Connect using:"
+          echo "ssh -p 2222 remote@$TS_IP"
+          echo ""
+          echo "Workspace:"
+          echo "/home/remote/workspace"
+          echo ""
+          echo "======================================"
+
+          docker exec linux-remote \
+            ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+
+          echo "======================================"
+
+      # -----------------------------------------
+      # 11. Keep session alive
+      # -----------------------------------------
+
+      - name: Keep remote session alive
+        shell: bash
+        run: |
+          echo "Remote Linux session is active."
+          echo "Cancel this workflow to end the session."
+
+          while true; do
+            sleep 300
+          done
+
+      # -----------------------------------------
+      # 12. Save workspace snapshot
+      # -----------------------------------------
+
+      - name: Create workspace snapshot
+        id: snapshot
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          WORKSPACE="$RUNNER_TEMP/remote-workspace"
+          ARCHIVE="$RUNNER_TEMP/workspace.tar.gz"
+
+          if [[ ! -d "$WORKSPACE" ]]; then
+            echo "Workspace unavailable."
+            exit 1
+          fi
+
+          tar -czf "$ARCHIVE" \
+            --exclude='.ssh' \
+            --exclude='*/.ssh' \
+            --exclude='.aws' \
+            --exclude='*/.aws' \
+            --exclude='.kube' \
+            --exclude='*/.kube' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            --exclude='*/.env' \
+            --exclude='*/.env.*' \
+            --exclude='*.pem' \
+            --exclude='*.key' \
+            -C "$WORKSPACE" .
+
+          echo "Snapshot created."
+          du -h "$ARCHIVE"
+
+      # -----------------------------------------
+      # 13. Upload workspace
+      # -----------------------------------------
+
+      - name: Save workspace to GitHub
+        if: always() && steps.snapshot.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-remote-workspace
+          path: ${{ runner.temp }}/workspace.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      # -----------------------------------------
+      # 14. Cleanup
+      # -----------------------------------------
+
+      - name: Cleanup Linux container
+        if: always()
+        shell: bash
+        run: |
+          echo "Removing Linux container..."
+
+          docker rm -f linux-remote 2>/dev/null || true
+
+          echo "Container cleanup completed."
