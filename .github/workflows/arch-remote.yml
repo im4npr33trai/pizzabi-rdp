@@ -37,7 +37,7 @@ jobs:
             });
 
             for (const run of runs.data.workflow_runs) {
-              if (run.id === context.runId || run.conclusion !== "success") {
+              if (run.id === context.runId) {
                 continue;
               }
 
@@ -207,20 +207,16 @@ jobs:
 
           docker exec -d linux-remote /usr/sbin/sshd -D -e
 
-      - name: Download and Run Linux Download.sh
+      - name: Copy and Run Linux Download.sh
         run: |
           set -euo pipefail
 
-          DOWNLOAD_URL="REPLACE_WITH_DIRECT_URL_TO_YOUR_LINUX_Download.sh"
-
-          if [[ "$DOWNLOAD_URL" == *"REPLACE_WITH_DIRECT_URL"* ]]; then
-            echo "Replace DOWNLOAD_URL with the direct URL of a Linux shell script."
+          if [ ! -f "$GITHUB_WORKSPACE/Download.sh" ]; then
+            echo "Download.sh was not found in the repository root."
             exit 1
           fi
 
-          docker exec linux-remote curl --fail --location --show-error \
-            "$DOWNLOAD_URL" --output /home/remote/Download.sh
-
+          docker cp "$GITHUB_WORKSPACE/Download.sh" linux-remote:/home/remote/Download.sh
           docker exec linux-remote chown remote:remote /home/remote/Download.sh
           docker exec linux-remote chmod 700 /home/remote/Download.sh
 
