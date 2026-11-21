@@ -174,7 +174,7 @@ jobs:
             mkdir -p /run/sshd /run/xrdp /workspace /home/remote/.ssh
             chown -R remote:remote /workspace /home/remote/.ssh
             chmod 700 /home/remote/.ssh
-            printf '%s\\n' 'startxfce4' > /home/remote/.xsession
+            printf "%s\\n" startxfce4 > /home/remote/.xsession
             chown remote:remote /home/remote/.xsession
             chmod 600 /home/remote/.xsession
             ssh-keygen -A
@@ -194,8 +194,7 @@ jobs:
             echo "Missing repository secret: RDP_PASSWORD"
             exit 1
           fi
-
-          printf 'remote:%s\\n' "$RDP_PASSWORD" |
+          printf '%s:%s\n' remote "$RDP_PASSWORD" |
             docker exec -i linux-remote chpasswd
 
           docker exec linux-remote bash -c '
@@ -224,8 +223,12 @@ jobs:
           docker exec -d linux-remote /usr/sbin/sshd -D -e
 
           # Start the XFCE desktop's RDP services inside the Ubuntu container.
-          docker exec linux-remote service xrdp-sesman start
-          docker exec linux-remote service xrdp start
+          docker exec -d linux-remote /usr/sbin/xrdp-sesman --nodaemon
+          sleep 1
+          docker exec -d linux-remote /usr/sbin/xrdp --nodaemon
+          sleep 2
+          docker exec linux-remote pgrep -a xrdp-sesman
+          docker exec linux-remote pgrep -a xrdp
 
       - name: Copy and Run Linux Download.sh
         run: |
@@ -253,16 +256,18 @@ jobs:
           for attempt in $(seq 1 20); do
             if nc -z -w 3 "$TS_IP" 2222; then
               echo "SSH port 2222 is reachable."
-              exit 0
+              break
             fi
 
             echo "Waiting for SSH server ($attempt/20)..."
             sleep 3
           done
 
-          echo "SSH port 2222 is not reachable."
-          docker logs linux-remote || true
-          exit 1
+          if ! nc -z -w 3 "$TS_IP" 2222; then
+            echo "SSH port 2222 is not reachable."
+            docker logs linux-remote || true
+            exit 1
+          fi
 
           echo "Checking RDP on $TS_IP:3389"
           for attempt in $(seq 1 30); do
