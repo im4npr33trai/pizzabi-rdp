@@ -194,10 +194,8 @@ jobs:
             log "WARNING: /dev/kvm is not mounted; KVM acceleration is unavailable."
           fi
 
-          # Install the public key only. SSH password authentication remains disabled.
-          cat > /home/remote/.ssh/authorized_keys
-          chown remote:remote /home/remote/.ssh/authorized_keys
-          chmod 600 /home/remote/.ssh/authorized_keys
+          # SSH public key is injected separately through docker exec stdin below.
+          # SSH password authentication remains disabled.
 
           cat > /etc/ssh/sshd_config <<'SSHD_CONFIG'
           Port 2222
