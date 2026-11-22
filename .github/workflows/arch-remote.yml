@@ -155,6 +155,17 @@ jobs:
             docker.io docker-compose-v2 \
             qemu-kvm cpu-checker libvirt-daemon-system libvirt-clients bridge-utils
 
+          log "Adding the official signed GitHub CLI apt repository..."
+          install -d -m 0755 /etc/apt/keyrings
+          GH_KEYRING_TMP="$(mktemp)"
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o "$GH_KEYRING_TMP"
+          echo "6084d5d7bd8e288441e0e94fc6275570895da18e6751f70f057485dc2d1a811b  $GH_KEYRING_TMP" | sha256sum -c -
+          install -m 0644 "$GH_KEYRING_TMP" /etc/apt/keyrings/githubcli-archive-keyring.gpg
+          rm -f "$GH_KEYRING_TMP"
+          printf '%s\\n' "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
+          apt-get update
+          apt-get install -y --no-install-recommends gh
+
           log "Creating remote user and SSH configuration..."
           id remote >/dev/null 2>&1 || useradd --create-home --shell /bin/bash remote
           usermod -aG sudo remote
@@ -272,10 +283,17 @@ jobs:
             fi
           '
 
-          log "Installing OpenCode 2 and Herdr for the remote user..."
+          log "Installing Claude Code, OpenCode 2 and Herdr for the remote user..."
           su - remote -s /bin/bash -c '
             set -e
             export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
+            mkdir -p "$HOME/.claude"
+
+            if ! command -v claude >/dev/null 2>&1; then
+              curl -fsSL https://claude.ai/install.sh | bash
+            else
+              echo "Claude Code already installed; skipping installer."
+            fi
 
             if ! command -v opencode >/dev/null 2>&1; then
               curl -fsSL https://opencode.ai/v2/install | bash
@@ -286,7 +304,12 @@ jobs:
             if ! command -v herdr >/dev/null 2>&1; then
               curl -fsSL https://herdr.dev/install.sh | sh
             else
-              echo "Herdr already installed; skipping installer."
+              echo "Herdr TUI already installed; skipping installer."
+            fi
+
+            export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
+            if command -v herdr >/dev/null 2>&1 && command -v claude >/dev/null 2>&1; then
+              herdr integration install claude
             fi
           '
 
@@ -349,8 +372,10 @@ jobs:
             git --version
             docker --version || true
             docker compose version || true
+            claude --version
+            gh --version
             opencode --version
-            command -v herdr
+            herdr --version
             sdkmanager --version
             adb version
             emulator -version | head -n 2 || true
