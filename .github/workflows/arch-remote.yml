@@ -1,4 +1,4 @@
-name: Ubuntu Linux Desktop + Tailscale + SSH + RDP
+name: Ubuntu Headless Development Runner + Tailscale + SSH
 
 on:
   workflow_dispatch:
@@ -20,7 +20,6 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Restore the latest successful workspace artifact from this workflow.
       - name: Find Previous Workspace Snapshot
         id: previous
         uses: actions/github-script@v7
@@ -36,9 +35,7 @@ jobs:
             });
 
             for (const run of runs.data.workflow_runs) {
-              if (run.id === context.runId) {
-                continue;
-              }
+              if (run.id === context.runId) continue;
 
               const response = await github.rest.actions.listWorkflowRunArtifacts({
                 owner: context.repo.owner,
@@ -61,8 +58,7 @@ jobs:
             console.log("No previous workspace snapshot found.");
 
       - name: Prepare Workspace Directory
-        run: |
-          mkdir -p "$RUNNER_TEMP/remote-workspace"
+        run: mkdir -p "$RUNNER_TEMP/remote-workspace"
 
       - name: Download Previous Workspace
         if: steps.previous.outputs.run_id != ''
@@ -85,7 +81,6 @@ jobs:
             echo "No workspace archive was present in the downloaded artifact."
           fi
 
-      # Reusable, ephemeral Tailscale auth key stored as a GitHub Actions secret.
       - name: Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
@@ -95,113 +90,116 @@ jobs:
 
       - name: Verify Tailscale Connection
         run: |
+          set -euo pipefail
           TS_IP="$(tailscale ip -4 | head -n 1)"
+          test -n "$TS_IP" || { echo "Tailscale did not assign an IPv4 address."; exit 1; }
+          echo "Tailscale connection established: $TS_IP"
 
-          if [ -z "$TS_IP" ]; then
-            echo "Tailscale did not assign an IPv4 address."
-            exit 1
-          fi
-
-          echo "Tailscale connection established."
-          echo "Tailscale IPv4: $TS_IP"
-
-      - name: Start Ubuntu 24.04 Container
+      - name: Start Headless Ubuntu 24.04 Container
         run: |
+          set -euo pipefail
           docker pull ubuntu:24.04
           docker rm -f linux-remote 2>/dev/null || true
 
-          docker run -d \
-            --name linux-remote \
-            --network host \
-            --restart=no \
-            --volume "$RUNNER_TEMP/remote-workspace:/workspace" \
-            ubuntu:24.04 \
-            sleep infinity
+          DOCKER_ARGS=(
+            --name linux-remote
+            --network host
+            --restart=no
+            --volume "$RUNNER_TEMP/remote-workspace:/workspace"
+          )
 
-      - name: Install Linux Tools, XFCE Desktop, SSH and RDP
+          # Expose the host Docker daemon when the runner provides its socket.
+          if [ -S /var/run/docker.sock ]; then
+            DOCKER_ARGS+=(--volume /var/run/docker.sock:/var/run/docker.sock)
+            echo "Host Docker socket will be exposed to the container."
+          else
+            echo "WARNING: Host Docker socket is unavailable; Docker CLI will be installed without a daemon."
+          fi
+
+          # Nested virtualization is optional and depends on host support.
+          if [ -e /dev/kvm ]; then
+            DOCKER_ARGS+=(--device /dev/kvm:/dev/kvm)
+            echo "Host /dev/kvm will be exposed to the container."
+          else
+            echo "WARNING: Host /dev/kvm is unavailable; Android Emulator hardware acceleration will not be available."
+          fi
+
+          docker run -d "${DOCKER_ARGS[@]}" ubuntu:24.04 sleep infinity
+
+      - name: Install Headless Development Environment
         env:
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           set -euo pipefail
 
-          docker exec linux-remote bash -c '
-            set -e
-            export DEBIAN_FRONTEND=noninteractive
-
-            apt-get update
-            apt-get install -y --no-install-recommends \
-              openssh-server \
-              xrdp \
-              xorgxrdp \
-              xfce4 \
-              xfce4-goodies \
-              dbus-x11 \
-              sudo \
-              ca-certificates \
-              curl \
-              wget \
-              git \
-              build-essential \
-              pkg-config \
-              vim \
-              nano \
-              tmux \
-              htop \
-              unzip \
-              zip \
-              jq \
-              procps \
-              iproute2 \
-              iputils-ping \
-              netcat-openbsd \
-              python3 \
-              python3-pip \
-              python3-venv \
-              bash-completion \
-              file \
-              xz-utils \
-              zstd
-
-            id remote >/dev/null 2>&1 || useradd --create-home --shell /bin/bash remote
-            usermod -aG sudo remote
-            adduser xrdp ssl-cert || true
-
-            printf "%s\\n" "remote ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/remote
-            chmod 0440 /etc/sudoers.d/remote
-            visudo -cf /etc/sudoers.d/remote
-
-            mkdir -p /run/sshd /run/xrdp /workspace /home/remote/.ssh
-            chown -R remote:remote /workspace /home/remote/.ssh
-            chmod 700 /home/remote/.ssh
-            printf "%s\\n" startxfce4 > /home/remote/.xsession
-            chown remote:remote /home/remote/.xsession
-            chmod 600 /home/remote/.xsession
-            ssh-keygen -A
-          '
-
-          # This is a PUBLIC key. Never put your private key in this file.
           if [ -z "${SSH_PUBLIC_KEY//[[:space:]]/}" ]; then
             echo "Missing repository secret: SSH_PUBLIC_KEY"
             exit 1
           fi
 
-          printf '%s\n' "$SSH_PUBLIC_KEY" |
-            docker exec -i linux-remote tee /home/remote/.ssh/authorized_keys >/dev/null
+          docker exec -i linux-remote bash -s <<'CONTAINER_SETUP'
+          set -Eeuo pipefail
+          export DEBIAN_FRONTEND=noninteractive
 
-          # Set the desktop password from a GitHub Actions secret without logging it.
-          if [ -z "${RDP_PASSWORD//[[:space:]]/}" ]; then
-            echo "Missing repository secret: RDP_PASSWORD"
-            exit 1
+          log() { printf '\n[runner-setup] %s\n' "$*"; }
+
+          log "Updating apt indexes and installing system packages..."
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl wget gnupg unzip zip p7zip-full xz-utils zstd file \
+            git openssh-server sudo build-essential pkg-config cmake ninja-build \
+            clang lldb vim nano tmux htop btop ripgrep fd-find bat tree fzf \
+            zsh fish neovim jq procps iproute2 iputils-ping netcat-openbsd \
+            python3 python3-pip python3-venv \
+            openjdk-21-jdk \
+            docker.io docker-compose-v2 \
+            qemu-kvm cpu-checker libvirt-daemon-system libvirt-clients bridge-utils
+
+          log "Creating remote user and SSH configuration..."
+          id remote >/dev/null 2>&1 || useradd --create-home --shell /bin/bash remote
+          usermod -aG sudo remote
+          printf '%s\n' "remote ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/remote
+          chmod 0440 /etc/sudoers.d/remote
+          visudo -cf /etc/sudoers.d/remote
+
+          mkdir -p /run/sshd /workspace /home/remote/.ssh /home/remote/Downloads /home/remote/Projects /home/remote/.local/bin
+          chown -R remote:remote /workspace /home/remote
+          chmod 700 /home/remote/.ssh
+          ssh-keygen -A
+
+          # Give the remote user access to the host Docker socket when mounted.
+          if [ -S /var/run/docker.sock ]; then
+            DOCKER_GID="$(stat -c '%g' /var/run/docker.sock)"
+            DOCKER_GROUP="$(getent group "$DOCKER_GID" | cut -d: -f1 || true)"
+            if [ -z "$DOCKER_GROUP" ]; then
+              DOCKER_GROUP="hostdocker"
+              getent group "$DOCKER_GROUP" >/dev/null 2>&1 || groupadd --gid "$DOCKER_GID" "$DOCKER_GROUP"
+            fi
+            usermod -aG "$DOCKER_GROUP" remote
+            log "Added remote to Docker socket group ($DOCKER_GROUP, GID $DOCKER_GID)."
           fi
-          printf '%s:%s\n' remote "$RDP_PASSWORD" |
-            docker exec -i linux-remote chpasswd
 
-          docker exec linux-remote bash -c '
-            chown remote:remote /home/remote/.ssh/authorized_keys
-            chmod 600 /home/remote/.ssh/authorized_keys
+          # Match the KVM device group ID instead of assuming a fixed group number.
+          if [ -e /dev/kvm ]; then
+            KVM_GID="$(stat -c '%g' /dev/kvm)"
+            KVM_GROUP="$(getent group "$KVM_GID" | cut -d: -f1 || true)"
+            if [ -z "$KVM_GROUP" ]; then
+              KVM_GROUP="hostkvm"
+              getent group "$KVM_GROUP" >/dev/null 2>&1 || groupadd --gid "$KVM_GID" "$KVM_GROUP"
+            fi
+            usermod -aG "$KVM_GROUP" remote
+            chmod g+rw /dev/kvm || true
+            log "Added remote to KVM device group ($KVM_GROUP, GID $KVM_GID)."
+          else
+            log "WARNING: /dev/kvm is not mounted; KVM acceleration is unavailable."
+          fi
 
-            cat > /etc/ssh/sshd_config <<EOF
+          # Install the public key only. SSH password authentication remains disabled.
+          cat > /home/remote/.ssh/authorized_keys
+          chown remote:remote /home/remote/.ssh/authorized_keys
+          chmod 600 /home/remote/.ssh/authorized_keys
+
+          cat > /etc/ssh/sshd_config <<'SSHD_CONFIG'
           Port 2222
           AddressFamily any
           ListenAddress 0.0.0.0
@@ -215,51 +213,128 @@ jobs:
           AllowTcpForwarding yes
           PermitTunnel no
           Subsystem sftp /usr/lib/openssh/sftp-server
-          EOF
+          SSHD_CONFIG
 
-            sshd -t
+          sshd -t
+          docker --version
+          docker compose version
+          java -version
+          git --version
+
+          log "Installing Android command-line tools..."
+          ANDROID_HOME=/home/remote/Android/Sdk
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          if [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            TMP_DIR="$(mktemp -d)"
+            TOOL_ARCHIVE="$TMP_DIR/commandlinetools-linux.zip"
+            curl -fL --retry 3 --retry-delay 2 \
+              "https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip" \
+              -o "$TOOL_ARCHIVE"
+            echo "4e4c464f145a7512b57d088ac6c278c03c9eea610886b35a5e0804e74eedf583  $TOOL_ARCHIVE" | sha256sum -c -
+            mkdir -p "$TMP_DIR/extracted"
+            unzip -q "$TOOL_ARCHIVE" -d "$TMP_DIR/extracted"
+            rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+            mkdir -p "$ANDROID_HOME/cmdline-tools/latest"
+            cp -a "$TMP_DIR/extracted/cmdline-tools/." "$ANDROID_HOME/cmdline-tools/latest/"
+            rm -rf "$TMP_DIR"
+          else
+            log "Android command-line tools already exist; skipping download."
+          fi
+
+          cat > /etc/profile.d/remote-android.sh <<'ANDROID_ENV'
+          export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+          export ANDROID_HOME=/home/remote/Android/Sdk
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$JAVA_HOME/bin:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          ANDROID_ENV
+          chmod 644 /etc/profile.d/remote-android.sh
+          chown -R remote:remote /home/remote/Android
+
+          log "Installing Android SDK API 36 packages and accepting licenses..."
+          su - remote -s /bin/bash -c '
+            set -e
+            source /etc/profile.d/remote-android.sh
+            set +o pipefail
+            yes | sdkmanager --sdk_root="$ANDROID_HOME" --licenses
+            set -o pipefail
+            sdkmanager --sdk_root="$ANDROID_HOME" \
+              "platform-tools" \
+              "platforms;android-36" \
+              "build-tools;36.0.0" \
+              "emulator" \
+              "system-images;android-36;google_apis;x86_64"
+
+            if ! avdmanager list avd | grep -Fq "Name: pizzora_api36_qa"; then
+              printf "no\n" | avdmanager create avd \
+                --name pizzora_api36_qa \
+                --package "system-images;android-36;google_apis;x86_64" \
+                --device pixel_6
+            else
+              echo "AVD pizzora_api36_qa already exists; preserving it."
+            fi
           '
+
+          log "Installing OpenCode 2 and Herdr for the remote user..."
+          su - remote -s /bin/bash -c '
+            set -e
+            export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
+
+            if ! command -v opencode >/dev/null 2>&1; then
+              curl -fsSL https://opencode.ai/v2/install | bash
+            else
+              echo "OpenCode already installed; skipping installer."
+            fi
+
+            if ! command -v herdr >/dev/null 2>&1; then
+              curl -fsSL https://herdr.dev/install.sh | sh
+            else
+              echo "Herdr already installed; skipping installer."
+            fi
+          '
+
+          # Ubuntu package names differ from their familiar command names.
+          if command -v fdfind >/dev/null 2>&1 && [ ! -e /home/remote/.local/bin/fd ]; then
+            ln -s "$(command -v fdfind)" /home/remote/.local/bin/fd
+          fi
+          if command -v batcat >/dev/null 2>&1 && [ ! -e /home/remote/.local/bin/bat ]; then
+            ln -s "$(command -v batcat)" /home/remote/.local/bin/bat
+          fi
+          chown -R remote:remote /home/remote/.local /home/remote/.opencode /home/remote/Android 2>/dev/null || true
+
+          log "Starting SSH daemon..."
+          /usr/sbin/sshd -t
+          CONTAINER_SETUP
+
+          # Feed the public key through stdin; never echo it into workflow logs.
+          printf '%s\n' "$SSH_PUBLIC_KEY" |
+            docker exec -i linux-remote bash -c 'cat > /home/remote/.ssh/authorized_keys && chown remote:remote /home/remote/.ssh/authorized_keys && chmod 600 /home/remote/.ssh/authorized_keys'
 
           docker exec -d linux-remote /usr/sbin/sshd -D -e
 
-          # Start the XFCE desktop's RDP services inside the Ubuntu container.
-          docker exec -d linux-remote /usr/sbin/xrdp-sesman --nodaemon
-          sleep 1
-          docker exec -d linux-remote /usr/sbin/xrdp --nodaemon
-          sleep 2
-          docker exec linux-remote pgrep -a xrdp-sesman
-          docker exec linux-remote pgrep -a xrdp
-
-      - name: Copy and Run Linux Download.sh
+      - name: Run Additional Terminal Utilities
         run: |
           set -euo pipefail
-
-          if [ ! -f "$GITHUB_WORKSPACE/Download.sh" ]; then
-            echo "Download.sh was not found in the repository root."
-            exit 1
+          if [ -f "$GITHUB_WORKSPACE/Download.sh" ]; then
+            docker cp "$GITHUB_WORKSPACE/Download.sh" linux-remote:/home/remote/Download.sh
+            docker exec linux-remote chown remote:remote /home/remote/Download.sh
+            docker exec linux-remote chmod 700 /home/remote/Download.sh
+            docker exec linux-remote su - remote -s /bin/bash -c 'bash /home/remote/Download.sh'
+          else
+            echo "Download.sh not found; core development environment is already installed by this workflow."
           fi
 
-          docker cp "$GITHUB_WORKSPACE/Download.sh" linux-remote:/home/remote/Download.sh
-          docker exec linux-remote chown remote:remote /home/remote/Download.sh
-          docker exec linux-remote chmod 700 /home/remote/Download.sh
-
-          docker exec linux-remote su - remote -c "bash /home/remote/Download.sh"
-
-      - name: Verify SSH and RDP Accessibility
+      - name: Verify Development Environment and SSH
         run: |
           set -euo pipefail
-
           TS_IP="$(tailscale ip -4 | head -n 1)"
 
           echo "Checking SSH on $TS_IP:2222"
-
-          for attempt in $(seq 1 20); do
+          for attempt in $(seq 1 30); do
             if nc -z -w 3 "$TS_IP" 2222; then
               echo "SSH port 2222 is reachable."
               break
             fi
-
-            echo "Waiting for SSH server ($attempt/20)..."
+            echo "Waiting for SSH server ($attempt/30)..."
             sleep 3
           done
 
@@ -269,51 +344,53 @@ jobs:
             exit 1
           fi
 
-          echo "Checking RDP on $TS_IP:3389"
-          for attempt in $(seq 1 30); do
-            if nc -z -w 3 "$TS_IP" 3389; then
-              echo "RDP port 3389 is reachable."
-              break
+          docker exec linux-remote su - remote -s /bin/bash -c '
+            source /etc/profile.d/remote-android.sh
+            echo "---- Installed tool versions ----"
+            java -version
+            git --version
+            docker --version || true
+            docker compose version || true
+            opencode --version
+            command -v herdr
+            sdkmanager --version
+            adb version
+            emulator -version | head -n 2 || true
+            echo "---- Android AVD ----"
+            avdmanager list avd
+            echo "---- Docker daemon ----"
+            docker info >/dev/null 2>&1 && echo "Host Docker daemon reachable." || echo "WARNING: Docker daemon unavailable."
+            echo "---- KVM ----"
+            if [ -e /dev/kvm ]; then
+              emulator -accel-check || echo "WARNING: Emulator acceleration check failed."
+            else
+              echo "WARNING: /dev/kvm unavailable; emulator will not have hardware acceleration."
             fi
-            echo "Waiting for xRDP ($attempt/30)..."
-            sleep 3
-          done
-
-          if ! nc -z -w 3 "$TS_IP" 3389; then
-            echo "RDP port 3389 is not reachable."
-            docker exec linux-remote service xrdp status || true
-            docker exec linux-remote service xrdp-sesman status || true
-            docker logs linux-remote || true
-            exit 1
-          fi
+          '
 
       - name: Maintain Remote Linux Session
         run: |
           set -euo pipefail
-
           TS_IP="$(tailscale ip -4 | head -n 1)"
 
           echo
           echo "========================================"
-          echo "UBUNTU 24.04 REMOTE LINUX"
+          echo "UBUNTU 24.04 HEADLESS DEVELOPMENT RUNNER"
           echo "========================================"
           echo "Tailscale IP: $TS_IP"
           echo "SSH Port:     2222"
-          echo "RDP Port:     3389"
           echo "Username:     remote"
-          echo "RDP Password: stored in GitHub secret RDP_PASSWORD (not printed)"
           echo "Workspace:    /workspace"
           echo
-          echo "SSH connection:"
+          echo "SSH:"
           echo "ssh -p 2222 remote@$TS_IP"
           echo
-          echo "Remmina connection:"
-          echo "Protocol: RDP"
-          echo "Server:   $TS_IP:3389"
-          echo "Username: remote"
-          echo "Password: value stored in GitHub secret RDP_PASSWORD"
-          echo "========================================"
+          echo "Zed Remote Development:"
+          echo "zed ssh://remote@$TS_IP:2222/workspace"
           echo
+          echo "Configure ~/.ssh/config with Host pizzabi-runner to use:"
+          echo "zed ssh://remote@pizzabi-runner:2222/workspace"
+          echo "========================================"
 
           while true; do
             if [ "$(docker inspect -f '{{.State.Running}}' linux-remote 2>/dev/null)" != "true" ]; then
@@ -321,26 +398,20 @@ jobs:
               docker logs linux-remote || true
               exit 1
             fi
-
-            echo "[$(date -Is)] Ubuntu remote session is running."
+            echo "[$(date -Is)] Headless Ubuntu session is running."
             sleep 300
           done
 
-      # These always() steps run when the session is cancelled or times out.
       - name: Create Workspace Snapshot
         id: snapshot
         if: always()
         run: |
           set -euo pipefail
-
           if [ ! -d "$RUNNER_TEMP/remote-workspace" ]; then
             echo "created=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
-          tar -czf "$RUNNER_TEMP/workspace.tar.gz" \
-            -C "$RUNNER_TEMP/remote-workspace" .
-
+          tar -czf "$RUNNER_TEMP/workspace.tar.gz" -C "$RUNNER_TEMP/remote-workspace" .
           echo "created=true" >> "$GITHUB_OUTPUT"
 
       - name: Upload Workspace Artifact
