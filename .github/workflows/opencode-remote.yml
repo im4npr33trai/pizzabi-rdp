@@ -1,0 +1,336 @@
+name: OpenCode Remote Runner + Tailscale + SSH
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: opencode-remote-session
+  cancel-in-progress: false
+
+jobs:
+  opencode-remote:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Find Previous Workspace and OpenCode Data
+        id: previous
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const workflowIds = ["opencode-remote.yml", "arch-remote.yml"];
+            const candidates = [];
+
+            for (const workflowId of workflowIds) {
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: workflowId,
+                branch: "Singh",
+                status: "completed",
+                per_page: 30
+              });
+
+              for (const run of runs.data.workflow_runs) {
+                if (run.id === context.runId) continue;
+
+                const response = await github.rest.actions.listWorkflowRunArtifacts({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: run.id
+                });
+
+                const artifact = response.data.artifacts.find(item =>
+                  !item.expired &&
+                  ["opencode-remote-state", "linux-remote-workspace"].includes(item.name)
+                );
+
+                if (artifact) {
+                  candidates.push({
+                    runId: run.id,
+                    artifactName: artifact.name,
+                    updatedAt: run.updated_at
+                  });
+                  break;
+                }
+              }
+            }
+
+            candidates.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+            const selected = candidates[0];
+
+            if (selected) {
+              core.setOutput("run_id", String(selected.runId));
+              core.setOutput("artifact_name", selected.artifactName);
+              console.log("Restoring state from run:", selected.runId, selected.artifactName);
+            } else {
+              core.setOutput("run_id", "");
+              core.setOutput("artifact_name", "");
+              console.log("No previous OpenCode/workspace artifact found.");
+            }
+
+      - name: Prepare Persistent Directories
+        run: |
+          mkdir -p "$RUNNER_TEMP/remote-workspace"
+          mkdir -p "$RUNNER_TEMP/remote-opencode-data"
+
+      - name: Download Previous State
+        if: steps.previous.outputs.run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.previous.outputs.artifact_name }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.previous.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/state-restore
+
+      - name: Restore Workspace and OpenCode Data
+        if: steps.previous.outputs.run_id != ''
+        run: |
+          set -euo pipefail
+
+          if [ -f "$RUNNER_TEMP/state-restore/workspace.tar.gz" ]; then
+            tar -xzf "$RUNNER_TEMP/state-restore/workspace.tar.gz" \
+              -C "$RUNNER_TEMP/remote-workspace"
+            echo "Workspace restored."
+          fi
+
+          if [ -f "$RUNNER_TEMP/state-restore/opencode-data.tar.gz" ]; then
+            tar -xzf "$RUNNER_TEMP/state-restore/opencode-data.tar.gz" \
+              -C "$RUNNER_TEMP/remote-opencode-data"
+            echo "OpenCode user data restored."
+          else
+            echo "No OpenCode data archive found; starting with an empty data directory."
+          fi
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          tags: "tag:github-actions"
+          version: latest
+
+      - name: Start Minimal Ubuntu Container
+        run: |
+          set -euo pipefail
+          docker pull ubuntu:24.04
+          docker rm -f opencode-remote 2>/dev/null || true
+
+          docker run -d \
+            --name opencode-remote \
+            --network host \
+            --restart=no \
+            --volume "$RUNNER_TEMP/remote-workspace:/workspace" \
+            --volume "$RUNNER_TEMP/remote-opencode-data:/home/remote/.local/share/opencode" \
+            ubuntu:24.04 sleep infinity
+
+      - name: Install OpenCode and Minimal SSH Runtime
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SSH_PUBLIC_KEY//[[:space:]]/}" ]; then
+            echo "Missing repository secret: SSH_PUBLIC_KEY"
+            exit 1
+          fi
+
+          docker exec opencode-remote bash -s <<'CONTAINER_SETUP'
+          set -Eeuo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl openssh-server
+          rm -rf /var/lib/apt/lists/*
+
+          id remote >/dev/null 2>&1 || useradd --create-home --shell /bin/bash remote
+
+          mkdir -p /run/sshd /workspace /home/remote/.ssh \
+            /home/remote/.local/share/opencode
+          chown -R remote:remote /workspace /home/remote
+          chmod 700 /home/remote/.ssh
+          ssh-keygen -A
+
+          cat > /etc/ssh/sshd_config <<'SSHD_CONFIG'
+          Port 2222
+          AddressFamily any
+          ListenAddress 0.0.0.0
+          PermitRootLogin no
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          UsePAM no
+          AllowUsers remote
+          X11Forwarding no
+          AllowTcpForwarding local
+          PermitTunnel no
+          Subsystem sftp /usr/lib/openssh/sftp-server
+          SSHD_CONFIG
+
+          sshd -t
+          CONTAINER_SETUP
+
+          printf '%s\n' "$SSH_PUBLIC_KEY" |
+            docker exec -i opencode-remote bash -c '
+              cat > /home/remote/.ssh/authorized_keys &&
+              chown remote:remote /home/remote/.ssh/authorized_keys &&
+              chmod 600 /home/remote/.ssh/authorized_keys
+            '
+
+          docker exec -d opencode-remote /usr/sbin/sshd -D -e
+
+          docker exec opencode-remote su - remote -s /bin/bash -c '
+            set -e
+            export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
+
+            if ! command -v opencode >/dev/null 2>&1; then
+              curl -fsSL https://opencode.ai/v2/install | bash
+            fi
+
+            export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
+            opencode --version
+          '
+
+      - name: Start OpenCode Web on Port 49374
+        run: |
+          set -euo pipefail
+
+          docker exec opencode-remote su - remote -s /bin/bash -c '
+            set -e
+            export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
+
+            if ! command -v opencode >/dev/null 2>&1; then
+              echo "OpenCode installation not found."
+              exit 1
+            fi
+
+            if curl -fsS --max-time 2 http://127.0.0.1:49374/ >/dev/null 2>&1; then
+              echo "OpenCode Web is already responding on port 49374."
+              exit 0
+            fi
+
+            nohup opencode web --hostname 127.0.0.1 --port 49374 \
+              > "$HOME/opencode-web.log" 2>&1 < /dev/null &
+            echo $! > "$HOME/opencode-web.pid"
+
+            for attempt in $(seq 1 30); do
+              if curl -fsS --max-time 2 http://127.0.0.1:49374/ >/dev/null 2>&1; then
+                echo "OpenCode Web is responding on 127.0.0.1:49374."
+                exit 0
+              fi
+              sleep 2
+            done
+
+            echo "OpenCode Web did not become ready. Server log:"
+            cat "$HOME/opencode-web.log"
+            exit 1
+          '
+
+      - name: Verify SSH and OpenCode
+        run: |
+          set -euo pipefail
+          TS_IP="$(tailscale ip -4 | head -n 1)"
+          test -n "$TS_IP"
+
+          echo "Tailscale IP: $TS_IP"
+          echo "SSH port: 2222"
+          echo "OpenCode Web: 127.0.0.1:49374"
+
+          for attempt in $(seq 1 30); do
+            if timeout 3 bash -c ":</dev/tcp/$TS_IP/2222" 2>/dev/null; then
+              echo "SSH is reachable."
+              break
+            fi
+            echo "Waiting for SSH ($attempt/30)..."
+            sleep 2
+          done
+
+          timeout 3 bash -c ":</dev/tcp/$TS_IP/2222" 2>/dev/null || {
+            echo "SSH port 2222 is not reachable."
+            docker logs opencode-remote || true
+            exit 1
+          }
+
+          docker exec opencode-remote su - remote -s /bin/bash -c '
+            export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
+            opencode --version
+            curl -fsSI http://127.0.0.1:49374/ | head -n 1
+          '
+
+      - name: Maintain OpenCode Remote Session
+        run: |
+          set -euo pipefail
+          TS_IP="$(tailscale ip -4 | head -n 1)"
+
+          echo
+          echo "========================================"
+          echo "MINIMAL OPENCODE REMOTE RUNNER"
+          echo "========================================"
+          echo "Tailscale IP: $TS_IP"
+          echo "SSH:          ssh -p 2222 remote@$TS_IP"
+          echo "Workspace:    /workspace"
+          echo "OpenCode Web: http://127.0.0.1:49374"
+          echo
+          echo "On your local Arch machine, use:"
+          echo "ssh -N -L 49374:127.0.0.1:49374 -p 2222 remote@$TS_IP"
+          echo "========================================"
+
+          while true; do
+            if [ "$(docker inspect -f '{{.State.Running}}' opencode-remote 2>/dev/null)" != "true" ]; then
+              echo "OpenCode container stopped unexpectedly."
+              docker logs opencode-remote || true
+              exit 1
+            fi
+
+            if ! docker exec opencode-remote bash -c \
+              'curl -fsS --max-time 3 http://127.0.0.1:49374/ >/dev/null'; then
+              echo "OpenCode Web stopped responding."
+              docker exec opencode-remote bash -c \
+                'cat /home/remote/opencode-web.log' || true
+              exit 1
+            fi
+
+            echo "[$(date -Is)] OpenCode Web is running."
+            sleep 300
+          done
+
+      - name: Create Workspace and OpenCode Data Snapshots
+        id: snapshot
+        if: always()
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/remote-workspace"
+          mkdir -p "$RUNNER_TEMP/remote-opencode-data"
+
+          tar -czf "$RUNNER_TEMP/workspace.tar.gz" \
+            -C "$RUNNER_TEMP/remote-workspace" .
+          tar -czf "$RUNNER_TEMP/opencode-data.tar.gz" \
+            -C "$RUNNER_TEMP/remote-opencode-data" .
+
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload OpenCode State Artifact
+        if: always() && steps.snapshot.outputs.created == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-remote-state
+          path: |
+            ${{ runner.temp }}/workspace.tar.gz
+            ${{ runner.temp }}/opencode-data.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Cleanup OpenCode Container
+        if: always()
+        run: |
+          docker rm -f opencode-remote 2>/dev/null || true
+          echo "OpenCode container removed."
