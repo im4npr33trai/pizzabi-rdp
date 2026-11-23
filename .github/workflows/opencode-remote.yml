@@ -150,12 +150,34 @@ jobs:
           apt-get install -y --no-install-recommends ca-certificates curl openssh-server
           rm -rf /var/lib/apt/lists/*
 
-          id remote >/dev/null 2>&1 || useradd --create-home --shell /bin/bash remote
+          # The OpenCode bind mount can cause Docker to create /home/remote
+          # before the account exists. Create the group/user without relying
+          # on useradd creating an already-existing home directory.
+          if ! getent group remote >/dev/null 2>&1; then
+            groupadd --system remote
+          fi
 
-          mkdir -p /run/sshd /workspace /home/remote/.ssh \
+          if ! getent passwd remote >/dev/null 2>&1; then
+            useradd --no-create-home --home-dir /home/remote \
+              --shell /bin/bash --gid remote remote
+          fi
+
+          REMOTE_GROUP="$(id -gn remote)"
+          install -d -o remote -g "$REMOTE_GROUP" -m 0750 /home/remote
+          install -d -o remote -g "$REMOTE_GROUP" -m 0700 /home/remote/.ssh
+          install -d -o remote -g "$REMOTE_GROUP" -m 0750 \
             /home/remote/.local/share/opencode
-          chown -R remote:remote /workspace /home/remote
+          install -d -o remote -g "$REMOTE_GROUP" -m 0755 /workspace
+          install -d -m 0755 /run/sshd
+
+          chown -R remote:"$REMOTE_GROUP" /home/remote /workspace
           chmod 700 /home/remote/.ssh
+
+          if ! getent passwd remote >/dev/null 2>&1; then
+            echo "Failed to create the remote account." >&2
+            exit 1
+          fi
+          id remote
           ssh-keygen -A
 
           cat > /etc/ssh/sshd_config <<'SSHD_CONFIG'
@@ -179,14 +201,11 @@ jobs:
 
           printf '%s\n' "$SSH_PUBLIC_KEY" |
             docker exec -i opencode-remote bash -c '
-              set -e
-              id remote >/dev/null 2>&1 || {
-                echo "The remote user does not exist." >&2
-                exit 1
-              }
-              install -d -o remote -g remote -m 700 /home/remote/.ssh
+              set -euo pipefail
+              REMOTE_GROUP="$(id -gn remote)"
+              install -d -o remote -g "$REMOTE_GROUP" -m 700 /home/remote/.ssh
               cat > /home/remote/.ssh/authorized_keys
-              chown remote:remote /home/remote/.ssh/authorized_keys
+              chown remote:"$REMOTE_GROUP" /home/remote/.ssh/authorized_keys
               chmod 600 /home/remote/.ssh/authorized_keys
               test -s /home/remote/.ssh/authorized_keys
             '
