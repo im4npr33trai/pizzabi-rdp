@@ -162,7 +162,7 @@ jobs:
           log "Installing only the packages required for SSH and OpenCode..."
           apt-get update
           apt-get install -y --no-install-recommends \
-            ca-certificates curl openssh-server sudo
+            ca-certificates curl openssh-server sudo nodejs npm
           rm -rf /var/lib/apt/lists/*
 
           log "Creating remote user and SSH configuration..."
@@ -211,22 +211,15 @@ jobs:
           docker exec -d opencode-remote /usr/sbin/sshd -D -e
 
           log() { printf '\n[runner-setup] %s\n' "$*"; }
-          log "Installing OpenCode for the remote user..."
+          log "Installing free-coding-models for the remote user..."
           docker exec opencode-remote su - remote -s /bin/bash -c '
             set -e
-            export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
-
-            if ! command -v opencode >/dev/null 2>&1; then
-              curl -fsSL https://opencode.ai/v2/install | bash
-            else
-              echo "OpenCode is already installed; skipping installer."
-            fi
-
-            export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
-            opencode --version
+            npm install --global free-coding-models
+            free-coding-models --help >/dev/null
+            free-coding-models --version 2>/dev/null || true
           '
 
-      - name: Verify SSH and OpenCode CLI
+      - name: Verify SSH and free-coding-models CLI
         run: |
           set -euo pipefail
           TS_IP="$(tailscale ip -4 | head -n 1)"
@@ -251,36 +244,53 @@ jobs:
           fi
 
           docker exec opencode-remote su - remote -s /bin/bash -c '
-            export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
-            command -v opencode
-            opencode --version
+            command -v free-coding-models
+            free-coding-models --help >/dev/null
+            node --version
+            npm --version
           '
 
-      - name: Maintain OpenCode CLI Session
+      - name: Start Free Coding Models Router and Maintain Session
         run: |
           set -euo pipefail
           TS_IP="$(tailscale ip -4 | head -n 1)"
 
           echo
           echo "========================================"
-          echo "MINIMAL OPENCODE CLI RUNNER"
+          echo "FREE CODING MODELS RUNNER"
           echo "========================================"
           echo "Tailscale IP: $TS_IP"
           echo "SSH:          ssh -p 2222 remote@$TS_IP"
           echo "Workspace:    /workspace"
           echo
-          echo "Connect over SSH and run: opencode"
-          echo "No OpenCode Web server or HTTP port is started."
+          echo "Connect over SSH and run: free-coding-models"
+          echo "Router start: free-coding-models --daemon-bg"
+          echo "Router endpoint: http://127.0.0.1:19280/v1 (after startup)"
+          echo "OpenCode is not installed or started by this workflow."
           echo "========================================"
+
+          # Start the router only when at least one provider key was supplied.
+          # Keys are read from GitHub Actions secrets and passed into the container
+          # environment; they are never printed or written to the workflow logs.
+          docker exec opencode-remote su - remote -s /bin/bash -c '
+            set -e
+            if [ -n "${NVIDIA_API_KEY:-}${GROQ_API_KEY:-}${CEREBRAS_API_KEY:-}${OPENROUTER_API_KEY:-}${KILO_API_KEY:-}${POLLINATIONS_API_KEY:-}" ]; then
+              free-coding-models --sync-set auto
+              free-coding-models --daemon-bg
+              free-coding-models --daemon-status
+            else
+              echo "No provider API key configured. FCM CLI is installed; run it interactively after connecting."
+            fi
+          '
 
           while true; do
             if [ "$(docker inspect -f '{{.State.Running}}' opencode-remote 2>/dev/null)" != "true" ]; then
-              echo "OpenCode container stopped unexpectedly."
+              echo "Remote container stopped unexpectedly."
               docker logs opencode-remote || true
               exit 1
             fi
 
-            echo "[$(date -Is)] OpenCode CLI runner is available."
+            echo "[$(date -Is)] Free Coding Models runner is available."
             sleep 300
           done
 
