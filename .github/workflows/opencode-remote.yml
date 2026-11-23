@@ -128,7 +128,7 @@ jobs:
             --network host \
             --restart=no \
             --volume "$RUNNER_TEMP/remote-workspace:/workspace" \
-            --volume "$RUNNER_TEMP/remote-opencode-data:/home/remote/.local/share/opencode" \
+            --volume "$RUNNER_TEMP/remote-opencode-data:/opencode-data" \
             ubuntu:24.04 sleep infinity
 
       - name: Install OpenCode and Minimal SSH Runtime
@@ -150,54 +150,26 @@ jobs:
           apt-get install -y --no-install-recommends ca-certificates curl openssh-server
           rm -rf /var/lib/apt/lists/*
 
-          # The OpenCode bind mount can cause Docker to create /home/remote
-          # before the account exists. Create the group/user without relying
-          # on useradd creating an already-existing home directory.
-          if ! getent group remote >/dev/null 2>&1; then
-            groupadd --system remote
-          fi
+          # Match the existing arch-remote.yml account setup exactly.
+          # OpenCode data is mounted at /opencode-data so Docker does not
+          # pre-create /home/remote before useradd creates the account.
+          id remote >/dev/null 2>&1 || useradd --create-home --shell /bin/bash remote
 
-          REMOTE_GID="$(getent group remote | cut -d: -f3)"
-          if [ -z "$REMOTE_GID" ]; then
-            echo "Could not resolve the remote group GID." >&2
-            getent group remote || true
-            exit 1
-          fi
-
-          if ! getent passwd remote >/dev/null 2>&1; then
-            echo "Creating remote account with primary GID $REMOTE_GID..."
-            if ! useradd --no-log-init --no-create-home \
-              --home-dir /home/remote --shell /bin/bash \
-              --gid "$REMOTE_GID" remote; then
-              echo "useradd failed; account database diagnostics:" >&2
-              getent passwd remote || true
-              getent group remote || true
-              tail -n 5 /etc/passwd || true
-              exit 1
-            fi
-          fi
-
-          if ! getent passwd remote >/dev/null 2>&1; then
-            echo "Remote account is still missing after user creation." >&2
-            getent passwd remote || true
-            getent group remote || true
-            exit 1
-          fi
-
-          REMOTE_GROUP="$(id -gn remote)"
-          install -d -o remote -g "$REMOTE_GROUP" -m 0750 /home/remote
-          install -d -o remote -g "$REMOTE_GROUP" -m 0700 /home/remote/.ssh
-          install -d -o remote -g "$REMOTE_GROUP" -m 0750 \
-            /home/remote/.local/share/opencode
-          install -d -o remote -g "$REMOTE_GROUP" -m 0755 /workspace
-          install -d -m 0755 /run/sshd
-
-          chown -R remote:"$REMOTE_GROUP" /home/remote /workspace
+          mkdir -p /run/sshd /workspace /home/remote/.ssh \
+            /home/remote/.local/share /opencode-data
+          chown -R remote:remote /workspace /home/remote /opencode-data
           chmod 700 /home/remote/.ssh
 
-          echo "Verified remote account:"
-          getent passwd remote
-          id remote
+          # Keep OpenCode's standard data path while persisting its contents
+          # through the separately mounted artifact directory.
+          if [ -e /home/remote/.local/share/opencode ] && \
+             [ ! -L /home/remote/.local/share/opencode ]; then
+            cp -a /home/remote/.local/share/opencode/. /opencode-data/ 2>/dev/null || true
+            rm -rf /home/remote/.local/share/opencode
+          fi
+          ln -sfn /opencode-data /home/remote/.local/share/opencode
+          chown -h remote:remote /home/remote/.local/share/opencode
+          chown -R remote:remote /opencode-data
           ssh-keygen -A
 
           cat > /etc/ssh/sshd_config <<'SSHD_CONFIG'
