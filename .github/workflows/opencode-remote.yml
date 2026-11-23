@@ -157,9 +157,31 @@ jobs:
             groupadd --system remote
           fi
 
+          REMOTE_GID="$(getent group remote | cut -d: -f3)"
+          if [ -z "$REMOTE_GID" ]; then
+            echo "Could not resolve the remote group GID." >&2
+            getent group remote || true
+            exit 1
+          fi
+
           if ! getent passwd remote >/dev/null 2>&1; then
-            useradd --no-create-home --home-dir /home/remote \
-              --shell /bin/bash --gid remote remote
+            echo "Creating remote account with primary GID $REMOTE_GID..."
+            if ! useradd --no-log-init --no-create-home \
+              --home-dir /home/remote --shell /bin/bash \
+              --gid "$REMOTE_GID" remote; then
+              echo "useradd failed; account database diagnostics:" >&2
+              getent passwd remote || true
+              getent group remote || true
+              tail -n 5 /etc/passwd || true
+              exit 1
+            fi
+          fi
+
+          if ! getent passwd remote >/dev/null 2>&1; then
+            echo "Remote account is still missing after user creation." >&2
+            getent passwd remote || true
+            getent group remote || true
+            exit 1
           fi
 
           REMOTE_GROUP="$(id -gn remote)"
@@ -173,10 +195,8 @@ jobs:
           chown -R remote:"$REMOTE_GROUP" /home/remote /workspace
           chmod 700 /home/remote/.ssh
 
-          if ! getent passwd remote >/dev/null 2>&1; then
-            echo "Failed to create the remote account." >&2
-            exit 1
-          fi
+          echo "Verified remote account:"
+          getent passwd remote
           id remote
           ssh-keygen -A
 
