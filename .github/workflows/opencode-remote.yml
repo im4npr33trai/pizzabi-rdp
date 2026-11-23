@@ -147,55 +147,17 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
 
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl openssh-server
+          apt-get install -y --no-install-recommends ca-certificates curl openssh-server sudo
           rm -rf /var/lib/apt/lists/*
 
-          # User and SSH setup copied directly from arch-remote.yml.
+          log() { printf '\n[runner-setup] %s\n' "$*"; }
+
+          log "Creating remote user and SSH configuration..."
           id remote >/dev/null 2>&1 || useradd --create-home --shell /bin/bash remote
           usermod -aG sudo remote
-          printf '%s\\n' "remote ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/remote
-          chmod 0440 /etc/sudoers.d/remote
-          visudo -cf /etc/sudoers.d/remote
-
-          mkdir -p /run/sshd /workspace /home/remote/.ssh /home/remote/Downloads /home/remote/Projects /home/remote/.local/bin /home/remote/.local/share
-          chown -R remote:remote /workspace /home/remote /opencode-data
-          chmod 700 /home/remote/.ssh
-
-          # Keep OpenCode's standard data path backed by the persistent artifact mount.
-          rm -rf /home/remote/.local/share/opencode
-          ln -s /opencode-data /home/remote/.local/share/opencode
-          chown -h remote:remote /home/remote/.local/share/opencode
-          ssh-keygen -A
-
-          cat > /etc/ssh/sshd_config <<'SSHD_CONFIG'
-          Port 2222
-          AddressFamily any
-          ListenAddress 0.0.0.0
-          PermitRootLogin no
-          PubkeyAuthentication yes
-          PasswordAuthentication no
-          KbdInteractiveAuthentication no
-          UsePAM no
-          AllowUsers remote
-          X11Forwarding no
-          AllowTcpForwarding local
-          PermitTunnel no
-          Subsystem sftp /usr/lib/openssh/sftp-server
-          SSHD_CONFIG
-
-          sshd -t
-          CONTAINER_SETUP
-
+          # Feed the public key through stdin; never echo it into workflow logs.
           printf '%s\n' "$SSH_PUBLIC_KEY" |
-            docker exec -i opencode-remote bash -c '
-              set -euo pipefail
-              REMOTE_GROUP="$(id -gn remote)"
-              install -d -o remote -g "$REMOTE_GROUP" -m 700 /home/remote/.ssh
-              cat > /home/remote/.ssh/authorized_keys
-              chown remote:"$REMOTE_GROUP" /home/remote/.ssh/authorized_keys
-              chmod 600 /home/remote/.ssh/authorized_keys
-              test -s /home/remote/.ssh/authorized_keys
-            '
+            docker exec -i opencode-remote bash -c 'cat > /home/remote/.ssh/authorized_keys && chown remote:remote /home/remote/.ssh/authorized_keys && chmod 600 /home/remote/.ssh/authorized_keys'
 
           docker exec -d opencode-remote /usr/sbin/sshd -D -e
 
