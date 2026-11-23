@@ -179,9 +179,16 @@ jobs:
 
           printf '%s\n' "$SSH_PUBLIC_KEY" |
             docker exec -i opencode-remote bash -c '
-              cat > /home/remote/.ssh/authorized_keys &&
-              chown remote:remote /home/remote/.ssh/authorized_keys &&
+              set -e
+              id remote >/dev/null 2>&1 || {
+                echo "The remote user does not exist." >&2
+                exit 1
+              }
+              install -d -o remote -g remote -m 700 /home/remote/.ssh
+              cat > /home/remote/.ssh/authorized_keys
+              chown remote:remote /home/remote/.ssh/authorized_keys
               chmod 600 /home/remote/.ssh/authorized_keys
+              test -s /home/remote/.ssh/authorized_keys
             '
 
           docker exec -d opencode-remote /usr/sbin/sshd -D -e
