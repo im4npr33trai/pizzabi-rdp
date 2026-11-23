@@ -1,4 +1,4 @@
-name: OpenCode Remote Runner + Tailscale + SSH
+name: Free Coding Models + OpenCode Remote Runner
 
 on:
   workflow_dispatch:
@@ -81,6 +81,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/remote-workspace"
           mkdir -p "$RUNNER_TEMP/remote-opencode-data"
+          mkdir -p "$RUNNER_TEMP/remote-fcm-data"
 
       - name: Download Previous State
         if: steps.previous.outputs.run_id != ''
@@ -109,6 +110,14 @@ jobs:
             echo "OpenCode user data restored."
           else
             echo "No OpenCode data archive found; starting with an empty directory."
+          fi
+
+          if [ -f "$RUNNER_TEMP/state-restore/fcm-data.tar.gz" ]; then
+            tar -xzf "$RUNNER_TEMP/state-restore/fcm-data.tar.gz" \
+              -C "$RUNNER_TEMP/remote-fcm-data"
+            echo "Free Coding Models configuration and provider settings restored."
+          else
+            echo "No FCM state archive found; starting with fresh settings."
           fi
 
       - name: Connect to Tailscale
@@ -140,6 +149,7 @@ jobs:
             --restart=no \
             --volume "$RUNNER_TEMP/remote-workspace:/workspace" \
             --volume "$RUNNER_TEMP/remote-opencode-data:/opencode-data" \
+            --volume "$RUNNER_TEMP/remote-fcm-data:/fcm-data" \
             ubuntu:24.04 sleep infinity
 
       - name: Install Minimal SSH Runtime and OpenCode
@@ -174,13 +184,22 @@ jobs:
 
           mkdir -p /run/sshd /workspace /home/remote/.ssh \
             /home/remote/Downloads /home/remote/Projects \
-            /home/remote/.local/bin /home/remote/.local/share /opencode-data
-          chown -R remote:remote /workspace /home/remote /opencode-data
+            /home/remote/.local/bin /home/remote/.local/share \
+            /home/remote/.config /opencode-data/user-data \
+            /opencode-data/config /fcm-data/state /fcm-data/backups
+          chown -R remote:remote /workspace /home/remote /opencode-data /fcm-data
           chmod 700 /home/remote/.ssh
 
-          # Keep OpenCode's normal data directory backed by the artifact mount.
-          ln -sfn /opencode-data /home/remote/.local/share/opencode
-          chown -h remote:remote /home/remote/.local/share/opencode
+          # Persist OpenCode data/config and Free Coding Models user settings.
+          ln -sfn /opencode-data/user-data /home/remote/.local/share/opencode
+          ln -sfn /opencode-data/config /home/remote/.config/opencode
+          ln -sfn /fcm-data/config.json /home/remote/.free-coding-models.json
+          ln -sfn /fcm-data/state /home/remote/.free-coding-models
+          ln -sfn /fcm-data/backups /home/remote/.free-coding-models.backups
+          ln -sfn /fcm-data/daemon.pid /home/remote/.free-coding-models-daemon.pid
+          ln -sfn /fcm-data/daemon.port /home/remote/.free-coding-models-daemon.port
+          ln -sfn /fcm-data/daemon.log /home/remote/.free-coding-models-daemon.log
+          ln -sfn /fcm-data/tokens.json /home/remote/.free-coding-models-tokens.json
           ssh-keygen -A
 
           cat > /etc/ssh/sshd_config <<'SSHD_CONFIG'
@@ -211,15 +230,33 @@ jobs:
           docker exec -d opencode-remote /usr/sbin/sshd -D -e
 
           log() { printf '\n[runner-setup] %s\n' "$*"; }
-          log "Installing free-coding-models for the remote user..."
+          log "Installing OpenCode CLI and free-coding-models..."
           docker exec opencode-remote su - remote -s /bin/bash -c '
-            set -e
-            npm install --global free-coding-models
+            set -euo pipefail
+
+            # Install npm globals in a directory writable by the remote user.
+            npm config set prefix "$HOME/.local"
+            export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
+
+            if ! command -v opencode >/dev/null 2>&1; then
+              curl -fsSL https://opencode.ai/v2/install | bash
+            else
+              echo "OpenCode is already installed; skipping installer."
+            fi
+
+            if ! command -v free-coding-models >/dev/null 2>&1; then
+              npm install --global free-coding-models
+            else
+              echo "free-coding-models is already installed; skipping npm install."
+            fi
+
+            export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
+            opencode --version
             free-coding-models --help >/dev/null
-            free-coding-models --version 2>/dev/null || true
+            echo "free-coding-models CLI is ready."
           '
 
-      - name: Verify SSH and free-coding-models CLI
+      - name: Verify SSH, OpenCode, and free-coding-models CLIs
         run: |
           set -euo pipefail
           TS_IP="$(tailscale ip -4 | head -n 1)"
@@ -244,44 +281,37 @@ jobs:
           fi
 
           docker exec opencode-remote su - remote -s /bin/bash -c '
+            export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
+            command -v opencode
+            opencode --version
             command -v free-coding-models
             free-coding-models --help >/dev/null
             node --version
             npm --version
           '
 
-      - name: Start Free Coding Models Router and Maintain Session
+      - name: Maintain Free Coding Models Remote Session
         run: |
           set -euo pipefail
           TS_IP="$(tailscale ip -4 | head -n 1)"
 
           echo
           echo "========================================"
-          echo "FREE CODING MODELS RUNNER"
+          echo "FREE CODING MODELS + OPENCODE RUNNER"
           echo "========================================"
           echo "Tailscale IP: $TS_IP"
           echo "SSH:          ssh -p 2222 remote@$TS_IP"
           echo "Workspace:    /workspace"
           echo
-          echo "Connect over SSH and run: free-coding-models"
-          echo "Router start: free-coding-models --daemon-bg"
-          echo "Router endpoint: http://127.0.0.1:19280/v1 (after startup)"
-          echo "OpenCode is not installed or started by this workflow."
+          echo "After connecting, run:"
+          echo "  cd /workspace"
+          echo "  free-coding-models --opencode"
+          echo
+          echo "FCM opens its interactive model dashboard."
+          echo "Choose a healthy model with Enter; FCM writes the OpenCode config"
+          echo "and launches OpenCode with the selected model."
+          echo "First run may prompt you to enter provider API keys."
           echo "========================================"
-
-          # Start the router only when at least one provider key was supplied.
-          # Keys are read from GitHub Actions secrets and passed into the container
-          # environment; they are never printed or written to the workflow logs.
-          docker exec opencode-remote su - remote -s /bin/bash -c '
-            set -e
-            if [ -n "${NVIDIA_API_KEY:-}${GROQ_API_KEY:-}${CEREBRAS_API_KEY:-}${OPENROUTER_API_KEY:-}${KILO_API_KEY:-}${POLLINATIONS_API_KEY:-}" ]; then
-              free-coding-models --sync-set auto
-              free-coding-models --daemon-bg
-              free-coding-models --daemon-status
-            else
-              echo "No provider API key configured. FCM CLI is installed; run it interactively after connecting."
-            fi
-          '
 
           while true; do
             if [ "$(docker inspect -f '{{.State.Running}}' opencode-remote 2>/dev/null)" != "true" ]; then
@@ -290,7 +320,7 @@ jobs:
               exit 1
             fi
 
-            echo "[$(date -Is)] Free Coding Models runner is available."
+            echo "[$(date -Is)] Free Coding Models + OpenCode runner is available."
             sleep 300
           done
 
@@ -301,11 +331,14 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/remote-workspace"
           mkdir -p "$RUNNER_TEMP/remote-opencode-data"
+          mkdir -p "$RUNNER_TEMP/remote-fcm-data"
 
           tar -czf "$RUNNER_TEMP/workspace.tar.gz" \
             -C "$RUNNER_TEMP/remote-workspace" .
           tar -czf "$RUNNER_TEMP/opencode-data.tar.gz" \
             -C "$RUNNER_TEMP/remote-opencode-data" .
+          tar -czf "$RUNNER_TEMP/fcm-data.tar.gz" \
+            -C "$RUNNER_TEMP/remote-fcm-data" .
 
           echo "created=true" >> "$GITHUB_OUTPUT"
 
@@ -317,6 +350,7 @@ jobs:
           path: |
             ${{ runner.temp }}/workspace.tar.gz
             ${{ runner.temp }}/opencode-data.tar.gz
+            ${{ runner.temp }}/fcm-data.tar.gz
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
