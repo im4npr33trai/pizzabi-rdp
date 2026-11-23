@@ -93,7 +93,7 @@ jobs:
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/state-restore
 
-      - name: Restore Previous Workspace and OpenCode Data
+      - name: Restore Previous Workspace, OpenCode, and FCM State
         if: steps.previous.outputs.run_id != ''
         run: |
           set -euo pipefail
@@ -152,7 +152,7 @@ jobs:
             --volume "$RUNNER_TEMP/remote-fcm-data:/fcm-data" \
             ubuntu:24.04 sleep infinity
 
-      - name: Install Minimal SSH Runtime and OpenCode
+      - name: Install SSH, Node.js, OpenCode, and FCM
         env:
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
@@ -303,11 +303,8 @@ jobs:
           echo "========================================"
           echo "Tailscale IP: $TS_IP"
           echo "SSH shell:    ssh -p 2222 remote@$TS_IP"
-          echo "FCM TUI:      ssh -t -p 2222 remote@$TS_IP 'cd /workspace && exec free-coding-models --opencode'"
+          echo "FCM TUI:      ssh -t -p 2222 remote@$TS_IP 'export PATH=\$HOME/.local/bin:\$HOME/.opencode/bin:\$PATH; export FCM_CONFIG_DIR=/fcm-data/config; cd /workspace && exec free-coding-models --opencode'"
           echo "Workspace:    /workspace"
-          echo
-          echo "The FCM TUI is launched directly in your SSH terminal."
-          echo "Choose a healthy model with Enter; FCM writes the OpenCode config"
           echo
           echo "FCM opens its interactive model dashboard."
           echo "Choose a healthy model with Enter; FCM writes the OpenCode config"
@@ -326,7 +323,7 @@ jobs:
             sleep 300
           done
 
-      - name: Create Workspace and OpenCode Data Snapshots
+      - name: Create Workspace and Tool State Snapshots
         id: snapshot
         if: always()
         run: |
@@ -344,7 +341,7 @@ jobs:
 
           echo "created=true" >> "$GITHUB_OUTPUT"
 
-      - name: Upload OpenCode State Artifact
+      - name: Upload Remote Tool State Artifact
         if: always() && steps.snapshot.outputs.created == 'true'
         uses: actions/upload-artifact@v4
         with:
@@ -357,7 +354,7 @@ jobs:
           retention-days: 30
           compression-level: 0
 
-      - name: Cleanup OpenCode Container
+      - name: Cleanup Remote Container
         if: always()
         run: |
           docker rm -f opencode-remote 2>/dev/null || true
