@@ -226,42 +226,7 @@ jobs:
             opencode --version
           '
 
-      - name: Start OpenCode Web on Port 49374
-        run: |
-          set -euo pipefail
-
-          docker exec opencode-remote su - remote -s /bin/bash -c '
-            set -e
-            export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
-
-            if ! command -v opencode >/dev/null 2>&1; then
-              echo "OpenCode installation not found."
-              exit 1
-            fi
-
-            if curl -fsS --max-time 2 http://127.0.0.1:49374/ >/dev/null 2>&1; then
-              echo "OpenCode Web is already responding on port 49374."
-              exit 0
-            fi
-
-            nohup opencode web --hostname 127.0.0.1 --port 49374 \
-              > "$HOME/opencode-web.log" 2>&1 < /dev/null &
-            echo $! > "$HOME/opencode-web.pid"
-
-            for attempt in $(seq 1 30); do
-              if curl -fsS --max-time 2 http://127.0.0.1:49374/ >/dev/null 2>&1; then
-                echo "OpenCode Web is responding on 127.0.0.1:49374."
-                exit 0
-              fi
-              sleep 2
-            done
-
-            echo "OpenCode Web did not become ready. Server log:"
-            cat "$HOME/opencode-web.log"
-            exit 1
-          '
-
-      - name: Verify SSH and OpenCode
+      - name: Verify SSH and OpenCode CLI
         run: |
           set -euo pipefail
           TS_IP="$(tailscale ip -4 | head -n 1)"
@@ -269,7 +234,6 @@ jobs:
 
           echo "Tailscale IP: $TS_IP"
           echo "SSH port: 2222"
-          echo "OpenCode Web: 127.0.0.1:49374"
 
           for attempt in $(seq 1 30); do
             if nc -z -w 3 "$TS_IP" 2222; then
@@ -288,26 +252,25 @@ jobs:
 
           docker exec opencode-remote su - remote -s /bin/bash -c '
             export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
+            command -v opencode
             opencode --version
-            curl -fsSI http://127.0.0.1:49374/ | head -n 1
           '
 
-      - name: Maintain OpenCode Remote Session
+      - name: Maintain OpenCode CLI Session
         run: |
           set -euo pipefail
           TS_IP="$(tailscale ip -4 | head -n 1)"
 
           echo
           echo "========================================"
-          echo "MINIMAL OPENCODE REMOTE RUNNER"
+          echo "MINIMAL OPENCODE CLI RUNNER"
           echo "========================================"
           echo "Tailscale IP: $TS_IP"
           echo "SSH:          ssh -p 2222 remote@$TS_IP"
           echo "Workspace:    /workspace"
-          echo "OpenCode Web: http://127.0.0.1:49374"
           echo
-          echo "On your local Arch machine, use:"
-          echo "ssh -N -L 49374:127.0.0.1:49374 -p 2222 remote@$TS_IP"
+          echo "Connect over SSH and run: opencode"
+          echo "No OpenCode Web server or HTTP port is started."
           echo "========================================"
 
           while true; do
@@ -317,15 +280,7 @@ jobs:
               exit 1
             fi
 
-            if ! docker exec opencode-remote bash -c \
-              'curl -fsS --max-time 3 http://127.0.0.1:49374/ >/dev/null'; then
-              echo "OpenCode Web stopped responding."
-              docker exec opencode-remote bash -c \
-                'cat /home/remote/opencode-web.log' || true
-              exit 1
-            fi
-
-            echo "[$(date -Is)] OpenCode Web is running."
+            echo "[$(date -Is)] OpenCode CLI runner is available."
             sleep 300
           done
 
