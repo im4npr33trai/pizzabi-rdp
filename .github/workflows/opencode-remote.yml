@@ -35,7 +35,7 @@ jobs:
                 workflow_id: workflowId,
                 branch: "Singh",
                 status: "completed",
-                per_page: 30
+                per_page: 50
               });
 
               for (const run of runs.data.workflow_runs) {
@@ -69,15 +69,16 @@ jobs:
             if (selected) {
               core.setOutput("run_id", String(selected.runId));
               core.setOutput("artifact_name", selected.artifactName);
-              console.log("Restoring state from run:", selected.runId, selected.artifactName);
+              console.log("Found previous state:", selected.runId, selected.artifactName);
             } else {
               core.setOutput("run_id", "");
               core.setOutput("artifact_name", "");
-              console.log("No previous OpenCode/workspace artifact found.");
+              console.log("No previous workspace/OpenCode artifact found.");
             }
 
       - name: Prepare Persistent Directories
         run: |
+          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/remote-workspace"
           mkdir -p "$RUNNER_TEMP/remote-opencode-data"
 
@@ -91,7 +92,7 @@ jobs:
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/state-restore
 
-      - name: Restore Workspace and OpenCode Data
+      - name: Restore Previous Workspace and OpenCode Data
         if: steps.previous.outputs.run_id != ''
         run: |
           set -euo pipefail
@@ -107,7 +108,7 @@ jobs:
               -C "$RUNNER_TEMP/remote-opencode-data"
             echo "OpenCode user data restored."
           else
-            echo "No OpenCode data archive found; starting with an empty data directory."
+            echo "No OpenCode data archive found; starting with an empty directory."
           fi
 
       - name: Connect to Tailscale
@@ -117,7 +118,17 @@ jobs:
           tags: "tag:github-actions"
           version: latest
 
-      - name: Start Minimal Ubuntu Container
+      - name: Verify Tailscale Connection
+        run: |
+          set -euo pipefail
+          TS_IP="$(tailscale ip -4 | head -n 1)"
+          test -n "$TS_IP" || {
+            echo "Tailscale did not assign an IPv4 address."
+            exit 1
+          }
+          echo "Tailscale connection established: $TS_IP"
+
+      - name: Start Minimal Ubuntu 24.04 Container
         run: |
           set -euo pipefail
           docker pull ubuntu:24.04
@@ -131,7 +142,7 @@ jobs:
             --volume "$RUNNER_TEMP/remote-opencode-data:/opencode-data" \
             ubuntu:24.04 sleep infinity
 
-      - name: Install OpenCode and Minimal SSH Runtime
+      - name: Install Minimal SSH Runtime and OpenCode
         env:
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
@@ -142,34 +153,76 @@ jobs:
             exit 1
           fi
 
-          docker exec opencode-remote bash -s <<'CONTAINER_SETUP'
+          docker exec -i opencode-remote bash -s <<'CONTAINER_SETUP'
           set -Eeuo pipefail
           export DEBIAN_FRONTEND=noninteractive
 
-          apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl openssh-server sudo
-          rm -rf /var/lib/apt/lists/*
-
           log() { printf '\n[runner-setup] %s\n' "$*"; }
+
+          log "Installing only the packages required for SSH and OpenCode..."
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl openssh-server sudo
+          rm -rf /var/lib/apt/lists/*
 
           log "Creating remote user and SSH configuration..."
           id remote >/dev/null 2>&1 || useradd --create-home --shell /bin/bash remote
           usermod -aG sudo remote
-          # Feed the public key through stdin; never echo it into workflow logs.
+          printf '%s\n' "remote ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/remote
+          chmod 0440 /etc/sudoers.d/remote
+          visudo -cf /etc/sudoers.d/remote
+
+          mkdir -p /run/sshd /workspace /home/remote/.ssh \
+            /home/remote/Downloads /home/remote/Projects \
+            /home/remote/.local/bin /home/remote/.local/share /opencode-data
+          chown -R remote:remote /workspace /home/remote /opencode-data
+          chmod 700 /home/remote/.ssh
+
+          # Keep OpenCode's normal data directory backed by the artifact mount.
+          ln -sfn /opencode-data /home/remote/.local/share/opencode
+          chown -h remote:remote /home/remote/.local/share/opencode
+          ssh-keygen -A
+
+          cat > /etc/ssh/sshd_config <<'SSHD_CONFIG'
+          Port 2222
+          AddressFamily any
+          ListenAddress 0.0.0.0
+          PermitRootLogin no
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          UsePAM yes
+          AllowUsers remote
+          X11Forwarding no
+          AllowTcpForwarding yes
+          PermitTunnel no
+          Subsystem sftp /usr/lib/openssh/sftp-server
+          SSHD_CONFIG
+
+          sshd -t
+          log "Minimal SSH runtime is configured."
+          CONTAINER_SETUP
+
+          # Inject the key in a separate docker exec, as in arch-remote.yml.
+          # This must remain OUTSIDE the CONTAINER_SETUP heredoc.
           printf '%s\n' "$SSH_PUBLIC_KEY" |
             docker exec -i opencode-remote bash -c 'cat > /home/remote/.ssh/authorized_keys && chown remote:remote /home/remote/.ssh/authorized_keys && chmod 600 /home/remote/.ssh/authorized_keys'
 
           docker exec -d opencode-remote /usr/sbin/sshd -D -e
 
+          log() { printf '\n[runner-setup] %s\n' "$*"; }
+          log "Installing OpenCode for the remote user..."
           docker exec opencode-remote su - remote -s /bin/bash -c '
             set -e
-            export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
+            export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
 
             if ! command -v opencode >/dev/null 2>&1; then
               curl -fsSL https://opencode.ai/v2/install | bash
+            else
+              echo "OpenCode is already installed; skipping installer."
             fi
 
-            export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
+            export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
             opencode --version
           '
 
@@ -179,7 +232,7 @@ jobs:
 
           docker exec opencode-remote su - remote -s /bin/bash -c '
             set -e
-            export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
+            export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
 
             if ! command -v opencode >/dev/null 2>&1; then
               echo "OpenCode installation not found."
@@ -219,22 +272,22 @@ jobs:
           echo "OpenCode Web: 127.0.0.1:49374"
 
           for attempt in $(seq 1 30); do
-            if timeout 3 bash -c ":</dev/tcp/$TS_IP/2222" 2>/dev/null; then
-              echo "SSH is reachable."
+            if nc -z -w 3 "$TS_IP" 2222; then
+              echo "SSH port 2222 is reachable."
               break
             fi
-            echo "Waiting for SSH ($attempt/30)..."
-            sleep 2
+            echo "Waiting for SSH server ($attempt/30)..."
+            sleep 3
           done
 
-          timeout 3 bash -c ":</dev/tcp/$TS_IP/2222" 2>/dev/null || {
+          if ! nc -z -w 3 "$TS_IP" 2222; then
             echo "SSH port 2222 is not reachable."
             docker logs opencode-remote || true
             exit 1
-          }
+          fi
 
           docker exec opencode-remote su - remote -s /bin/bash -c '
-            export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
+            export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
             opencode --version
             curl -fsSI http://127.0.0.1:49374/ | head -n 1
           '
@@ -281,7 +334,6 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-
           mkdir -p "$RUNNER_TEMP/remote-workspace"
           mkdir -p "$RUNNER_TEMP/remote-opencode-data"
 
