@@ -57,8 +57,10 @@ jobs:
             core.setOutput("run_id", "");
             console.log("No previous workspace snapshot found.");
 
-      - name: Prepare Workspace Directory
-        run: mkdir -p "$RUNNER_TEMP/remote-workspace"
+      - name: Prepare Persistent Directories
+        run: |
+          mkdir -p "$RUNNER_TEMP/remote-workspace"
+          mkdir -p "$RUNNER_TEMP/remote-opencode-data"
 
       - name: Download Previous Workspace
         if: steps.previous.outputs.run_id != ''
@@ -79,6 +81,15 @@ jobs:
             echo "Previous workspace restored."
           else
             echo "No workspace archive was present in the downloaded artifact."
+          fi
+
+          if [ -f "$RUNNER_TEMP/workspace-restore/opencode-data.tar.gz" ]; then
+            mkdir -p "$RUNNER_TEMP/remote-opencode-data"
+            tar -xzf "$RUNNER_TEMP/workspace-restore/opencode-data.tar.gz" \
+              -C "$RUNNER_TEMP/remote-opencode-data"
+            echo "Previous OpenCode user data restored."
+          else
+            echo "No previous OpenCode data archive found; starting with an empty OpenCode data directory."
           fi
 
       - name: Connect to Tailscale
@@ -106,6 +117,7 @@ jobs:
             --network host
             --restart=no
             --volume "$RUNNER_TEMP/remote-workspace:/workspace"
+            --volume "$RUNNER_TEMP/remote-opencode-data:/home/remote/.local/share/opencode"
           )
 
           # Expose the host Docker daemon when the runner provides its socket.
@@ -402,6 +414,7 @@ jobs:
           echo "SSH Port:     2222"
           echo "Username:     remote"
           echo "Workspace:    /workspace"
+          echo "OpenCode data: /home/remote/.local/share/opencode (persisted)"
           echo
           echo "SSH:"
           echo "ssh -p 2222 remote@$TS_IP"
@@ -433,6 +446,8 @@ jobs:
             exit 0
           fi
           tar -czf "$RUNNER_TEMP/workspace.tar.gz" -C "$RUNNER_TEMP/remote-workspace" .
+          mkdir -p "$RUNNER_TEMP/remote-opencode-data"
+          tar -czf "$RUNNER_TEMP/opencode-data.tar.gz" -C "$RUNNER_TEMP/remote-opencode-data" .
           echo "created=true" >> "$GITHUB_OUTPUT"
 
       - name: Upload Workspace Artifact
@@ -440,7 +455,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-remote-workspace
-          path: ${{ runner.temp }}/workspace.tar.gz
+          path: |
+            ${{ runner.temp }}/workspace.tar.gz
+            ${{ runner.temp }}/opencode-data.tar.gz
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
