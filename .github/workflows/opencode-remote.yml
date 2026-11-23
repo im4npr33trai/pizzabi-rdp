@@ -186,16 +186,18 @@ jobs:
             /home/remote/Downloads /home/remote/Projects \
             /home/remote/.local/bin /home/remote/.local/share \
             /home/remote/.config /opencode-data/user-data \
-            /opencode-data/config /fcm-data/state /fcm-data/backups
+            /opencode-data/config /fcm-data/config /fcm-data/state
           chown -R remote:remote /workspace /home/remote /opencode-data /fcm-data
           chmod 700 /home/remote/.ssh
 
           # Persist OpenCode data/config and Free Coding Models user settings.
           ln -sfn /opencode-data/user-data /home/remote/.local/share/opencode
           ln -sfn /opencode-data/config /home/remote/.config/opencode
-          ln -sfn /fcm-data/config.json /home/remote/.free-coding-models.json
           ln -sfn /fcm-data/state /home/remote/.free-coding-models
-          ln -sfn /fcm-data/backups /home/remote/.free-coding-models.backups
+          cat > /etc/profile.d/remote-tools.sh <<'REMOTE_TOOLS_ENV'
+          export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
+          export FCM_CONFIG_DIR=/fcm-data/config
+          REMOTE_TOOLS_ENV
           ln -sfn /fcm-data/daemon.pid /home/remote/.free-coding-models-daemon.pid
           ln -sfn /fcm-data/daemon.port /home/remote/.free-coding-models-daemon.port
           ln -sfn /fcm-data/daemon.log /home/remote/.free-coding-models-daemon.log
@@ -300,12 +302,12 @@ jobs:
           echo "FREE CODING MODELS + OPENCODE RUNNER"
           echo "========================================"
           echo "Tailscale IP: $TS_IP"
-          echo "SSH:          ssh -p 2222 remote@$TS_IP"
+          echo "SSH shell:    ssh -p 2222 remote@$TS_IP"
+          echo "FCM TUI:      ssh -t -p 2222 remote@$TS_IP 'cd /workspace && exec free-coding-models --opencode'"
           echo "Workspace:    /workspace"
           echo
-          echo "After connecting, run:"
-          echo "  cd /workspace"
-          echo "  free-coding-models --opencode"
+          echo "The FCM TUI is launched directly in your SSH terminal."
+          echo "Choose a healthy model with Enter; FCM writes the OpenCode config"
           echo
           echo "FCM opens its interactive model dashboard."
           echo "Choose a healthy model with Enter; FCM writes the OpenCode config"
