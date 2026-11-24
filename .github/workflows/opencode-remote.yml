@@ -1,125 +1,21 @@
-name: Free Coding Models + OpenCode Remote Runner
+name: OpenCode Wrap Remote Runner + Tailscale + SSH
 
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
-  actions: read
 
 concurrency:
-  group: opencode-remote-session
+  group: opencode-wrap-remote-session
   cancel-in-progress: false
 
 jobs:
-  opencode-remote:
+  opencode-wrap-remote:
     runs-on: ubuntu-24.04
     timeout-minutes: 350
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Find Previous Workspace and OpenCode Data
-        id: previous
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const workflowIds = ["opencode-remote.yml", "arch-remote.yml"];
-            const candidates = [];
-
-            for (const workflowId of workflowIds) {
-              const runs = await github.rest.actions.listWorkflowRuns({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                workflow_id: workflowId,
-                branch: "Singh",
-                status: "completed",
-                per_page: 50
-              });
-
-              for (const run of runs.data.workflow_runs) {
-                if (run.id === context.runId) continue;
-
-                const response = await github.rest.actions.listWorkflowRunArtifacts({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  run_id: run.id
-                });
-
-                const artifact = response.data.artifacts.find(item =>
-                  !item.expired &&
-                  ["opencode-remote-state", "linux-remote-workspace"].includes(item.name)
-                );
-
-                if (artifact) {
-                  candidates.push({
-                    runId: run.id,
-                    artifactName: artifact.name,
-                    updatedAt: run.updated_at
-                  });
-                  break;
-                }
-              }
-            }
-
-            candidates.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
-            const selected = candidates[0];
-
-            if (selected) {
-              core.setOutput("run_id", String(selected.runId));
-              core.setOutput("artifact_name", selected.artifactName);
-              console.log("Found previous state:", selected.runId, selected.artifactName);
-            } else {
-              core.setOutput("run_id", "");
-              core.setOutput("artifact_name", "");
-              console.log("No previous workspace/OpenCode artifact found.");
-            }
-
-      - name: Prepare Persistent Directories
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/remote-workspace"
-          mkdir -p "$RUNNER_TEMP/remote-opencode-data"
-          mkdir -p "$RUNNER_TEMP/remote-fcm-data"
-
-      - name: Download Previous State
-        if: steps.previous.outputs.run_id != ''
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ steps.previous.outputs.artifact_name }}
-          repository: ${{ github.repository }}
-          run-id: ${{ steps.previous.outputs.run_id }}
-          github-token: ${{ github.token }}
-          path: ${{ runner.temp }}/state-restore
-
-      - name: Restore Previous Workspace, OpenCode, and FCM State
-        if: steps.previous.outputs.run_id != ''
-        run: |
-          set -euo pipefail
-
-          if [ -f "$RUNNER_TEMP/state-restore/workspace.tar.gz" ]; then
-            tar -xzf "$RUNNER_TEMP/state-restore/workspace.tar.gz" \
-              -C "$RUNNER_TEMP/remote-workspace"
-            echo "Workspace restored."
-          fi
-
-          if [ -f "$RUNNER_TEMP/state-restore/opencode-data.tar.gz" ]; then
-            tar -xzf "$RUNNER_TEMP/state-restore/opencode-data.tar.gz" \
-              -C "$RUNNER_TEMP/remote-opencode-data"
-            echo "OpenCode user data restored."
-          else
-            echo "No OpenCode data archive found; starting with an empty directory."
-          fi
-
-          if [ -f "$RUNNER_TEMP/state-restore/fcm-data.tar.gz" ]; then
-            tar -xzf "$RUNNER_TEMP/state-restore/fcm-data.tar.gz" \
-              -C "$RUNNER_TEMP/remote-fcm-data"
-            echo "Free Coding Models configuration and provider settings restored."
-          else
-            echo "No FCM state archive found; starting with fresh settings."
-          fi
-
       - name: Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
@@ -137,22 +33,23 @@ jobs:
           }
           echo "Tailscale connection established: $TS_IP"
 
-      - name: Start Minimal Ubuntu 24.04 Container
+      - name: Start Minimal Ubuntu Container
         run: |
           set -euo pipefail
           docker pull ubuntu:24.04
-          docker rm -f opencode-remote 2>/dev/null || true
+          docker rm -f opencode-wrap-remote 2>/dev/null || true
 
+          # This workspace is intentionally ephemeral. It is not snapshotted,
+          # uploaded, downloaded, or restored between workflow runs.
+          mkdir -p "$RUNNER_TEMP/opencode-wrap-workspace"
           docker run -d \
-            --name opencode-remote \
+            --name opencode-wrap-remote \
             --network host \
             --restart=no \
-            --volume "$RUNNER_TEMP/remote-workspace:/workspace" \
-            --volume "$RUNNER_TEMP/remote-opencode-data:/opencode-data" \
-            --volume "$RUNNER_TEMP/remote-fcm-data:/fcm-data" \
+            --volume "$RUNNER_TEMP/opencode-wrap-workspace:/workspace" \
             ubuntu:24.04 sleep infinity
 
-      - name: Install SSH, Node.js, OpenCode, and FCM
+      - name: Install SSH, OpenCode CLI, Rust, and OpenCode Wrap
         env:
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
@@ -163,16 +60,16 @@ jobs:
             exit 1
           fi
 
-          docker exec -i opencode-remote bash -s <<'CONTAINER_SETUP'
+          docker exec -i opencode-wrap-remote bash -s <<'CONTAINER_SETUP'
           set -Eeuo pipefail
           export DEBIAN_FRONTEND=noninteractive
 
           log() { printf '\n[runner-setup] %s\n' "$*"; }
 
-          log "Installing only the packages required for SSH and OpenCode..."
+          log "Installing minimal system dependencies..."
           apt-get update
           apt-get install -y --no-install-recommends \
-            ca-certificates curl openssh-server sudo nodejs npm
+            ca-certificates curl git openssh-server sudo build-essential pkg-config
           rm -rf /var/lib/apt/lists/*
 
           log "Creating remote user and SSH configuration..."
@@ -184,25 +81,18 @@ jobs:
 
           mkdir -p /run/sshd /workspace /home/remote/.ssh \
             /home/remote/Downloads /home/remote/Projects \
-            /home/remote/.local/bin /home/remote/.local/share \
-            /home/remote/.config /opencode-data/user-data \
-            /opencode-data/config /fcm-data/config /fcm-data/state
-          chown -R remote:remote /workspace /home/remote /opencode-data /fcm-data
+            /home/remote/.local/bin /home/remote/.cargo/bin
+          chown -R remote:remote /workspace /home/remote
           chmod 700 /home/remote/.ssh
-
-          # Persist OpenCode data/config and Free Coding Models user settings.
-          ln -sfn /opencode-data/user-data /home/remote/.local/share/opencode
-          ln -sfn /opencode-data/config /home/remote/.config/opencode
-          ln -sfn /fcm-data/state /home/remote/.free-coding-models
-          cat > /etc/profile.d/remote-tools.sh <<'REMOTE_TOOLS_ENV'
-          export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
-          export FCM_CONFIG_DIR=/fcm-data/config
-          REMOTE_TOOLS_ENV
-          ln -sfn /fcm-data/daemon.pid /home/remote/.free-coding-models-daemon.pid
-          ln -sfn /fcm-data/daemon.port /home/remote/.free-coding-models-daemon.port
-          ln -sfn /fcm-data/daemon.log /home/remote/.free-coding-models-daemon.log
-          ln -sfn /fcm-data/tokens.json /home/remote/.free-coding-models-tokens.json
           ssh-keygen -A
+
+          cat > /etc/profile.d/remote-tools.sh <<'REMOTE_TOOLS_ENV'
+          export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
+          export WRAP_PORT=8000
+          export OPENCODE_PORT=4100
+          export WRAP_CWD=/workspace
+          REMOTE_TOOLS_ENV
+          chmod 644 /etc/profile.d/remote-tools.sh
 
           cat > /etc/ssh/sshd_config <<'SSHD_CONFIG'
           Port 2222
@@ -224,51 +114,58 @@ jobs:
           log "Minimal SSH runtime is configured."
           CONTAINER_SETUP
 
-          # Inject the key in a separate docker exec, as in arch-remote.yml.
-          # This must remain OUTSIDE the CONTAINER_SETUP heredoc.
+          # Inject the public key outside the setup heredoc.
           printf '%s\n' "$SSH_PUBLIC_KEY" |
-            docker exec -i opencode-remote bash -c 'cat > /home/remote/.ssh/authorized_keys && chown remote:remote /home/remote/.ssh/authorized_keys && chmod 600 /home/remote/.ssh/authorized_keys'
+            docker exec -i opencode-wrap-remote bash -c 'cat > /home/remote/.ssh/authorized_keys && chown remote:remote /home/remote/.ssh/authorized_keys && chmod 600 /home/remote/.ssh/authorized_keys'
 
-          docker exec -d opencode-remote /usr/sbin/sshd -D -e
+          docker exec -d opencode-wrap-remote /usr/sbin/sshd -D -e
 
           log() { printf '\n[runner-setup] %s\n' "$*"; }
-          log "Installing OpenCode CLI and free-coding-models..."
-          docker exec opencode-remote su - remote -s /bin/bash -c '
+          log "Installing OpenCode CLI v2, required by OpenCode Wrap..."
+          docker exec opencode-wrap-remote su - remote -s /bin/bash -c '
             set -euo pipefail
-
-            # Install npm globals in a directory writable by the remote user.
-            npm config set prefix "$HOME/.local"
-            export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
+            export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
 
             if ! command -v opencode >/dev/null 2>&1; then
               curl -fsSL https://opencode.ai/v2/install | bash
-            else
-              echo "OpenCode is already installed; skipping installer."
             fi
 
-            if ! command -v free-coding-models >/dev/null 2>&1; then
-              npm install --global free-coding-models
-            else
-              echo "free-coding-models is already installed; skipping npm install."
+            OPENCODE_VERSION="$(opencode --version)"
+            echo "OpenCode version: $OPENCODE_VERSION"
+            if ! printf "%s\n" "$OPENCODE_VERSION" | grep -Eq "(^|[^0-9])v?2\.[0-9]"; then
+              echo "OpenCode Wrap requires OpenCode CLI v2.x."
+              exit 1
             fi
 
-            export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
-            opencode --version
-            free-coding-models --help >/dev/null
-            echo "free-coding-models CLI is ready."
+            log() { printf "\n[runner-setup] %s\n" "$*"; }
+            log "Installing Rust stable with rustup..."
+            if ! command -v cargo >/dev/null 2>&1; then
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            fi
+
+            source "$HOME/.cargo/env"
+            export PATH="$HOME/.cargo/bin:$PATH"
+            cargo --version
+            rustc --version
+
+            log "Installing opencode-wrap from GitHub using Cargo..."
+            cargo install --git https://github.com/Fast-Editor/OpenCode-Wrap.git opencode-wrap
+
+            export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
+            command -v opencode
+            command -v cargo
+            command -v opencode-wrap
+            opencode-wrap --version
           '
 
-      - name: Verify SSH, OpenCode, and free-coding-models CLIs
+      - name: Verify SSH and OpenCode Wrap
         run: |
           set -euo pipefail
           TS_IP="$(tailscale ip -4 | head -n 1)"
           test -n "$TS_IP"
 
-          echo "Tailscale IP: $TS_IP"
-          echo "SSH port: 2222"
-
           for attempt in $(seq 1 30); do
-            if nc -z -w 3 "$TS_IP" 2222; then
+            if timeout 3 bash -c "</dev/tcp/$TS_IP/2222" 2>/dev/null; then
               echo "SSH port 2222 is reachable."
               break
             fi
@@ -276,86 +173,60 @@ jobs:
             sleep 3
           done
 
-          if ! nc -z -w 3 "$TS_IP" 2222; then
+          if ! timeout 3 bash -c "</dev/tcp/$TS_IP/2222" 2>/dev/null; then
             echo "SSH port 2222 is not reachable."
-            docker logs opencode-remote || true
+            docker logs opencode-wrap-remote || true
             exit 1
           fi
 
-          docker exec opencode-remote su - remote -s /bin/bash -c '
-            export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
-            command -v opencode
+          docker exec opencode-wrap-remote su - remote -s /bin/bash -c '
+            export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
             opencode --version
-            command -v free-coding-models
-            free-coding-models --help >/dev/null
-            node --version
-            npm --version
+            cargo --version
+            opencode-wrap --version
           '
 
-      - name: Maintain Free Coding Models Remote Session
+      - name: Keep OpenCode Wrap Runner Online
         run: |
           set -euo pipefail
           TS_IP="$(tailscale ip -4 | head -n 1)"
 
           echo
           echo "========================================"
-          echo "FREE CODING MODELS + OPENCODE RUNNER"
+          echo "OPENCODE WRAP REMOTE RUNNER IS READY"
           echo "========================================"
           echo "Tailscale IP: $TS_IP"
-          echo "SSH shell:    ssh -p 2222 remote@$TS_IP"
-          echo "FCM TUI:      ssh -t -p 2222 remote@$TS_IP 'export PATH=\$HOME/.local/bin:\$HOME/.opencode/bin:\$PATH; export FCM_CONFIG_DIR=/fcm-data/config; cd /workspace && exec free-coding-models --opencode'"
-          echo "Workspace:    /workspace"
+          echo "SSH:          ssh -p 2222 remote@$TS_IP"
+          echo "Workspace:    /workspace (ephemeral)"
           echo
-          echo "FCM opens its interactive model dashboard."
-          echo "Choose a healthy model with Enter; FCM writes the OpenCode config"
-          echo "and launches OpenCode with the selected model."
-          echo "First run may prompt you to enter provider API keys."
+          echo "First connect and authenticate OpenCode:"
+          echo "  ssh -t -p 2222 remote@$TS_IP"
+          echo "  opencode auth login"
+          echo
+          echo "Then start the wrapper:"
+          echo "  cd /workspace"
+          echo "  opencode-wrap"
+          echo
+          echo "OpenCode Wrap listens on 127.0.0.1:8000."
+          echo "From your local machine, open a second terminal and run:"
+          echo "  ssh -N -L 8000:127.0.0.1:8000 -p 2222 remote@$TS_IP"
+          echo "Local OpenAI-compatible API: http://127.0.0.1:8000/v1"
+          echo "Default model: opencode/deepseek-v4.1-flash-free"
           echo "========================================"
 
           while true; do
-            if [ "$(docker inspect -f '{{.State.Running}}' opencode-remote 2>/dev/null)" != "true" ]; then
-              echo "Remote container stopped unexpectedly."
-              docker logs opencode-remote || true
+            if [ "$(docker inspect -f '{{.State.Running}}' opencode-wrap-remote 2>/dev/null)" != "true" ]; then
+              echo "OpenCode Wrap container stopped unexpectedly."
+              docker logs opencode-wrap-remote || true
               exit 1
             fi
 
-            echo "[$(date -Is)] Free Coding Models + OpenCode runner is available."
+            echo "[$(date -Is)] OpenCode Wrap runner is available."
             sleep 300
           done
 
-      - name: Create Workspace and Tool State Snapshots
-        id: snapshot
+      - name: Cleanup OpenCode Wrap Container
         if: always()
         run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/remote-workspace"
-          mkdir -p "$RUNNER_TEMP/remote-opencode-data"
-          mkdir -p "$RUNNER_TEMP/remote-fcm-data"
-
-          tar -czf "$RUNNER_TEMP/workspace.tar.gz" \
-            -C "$RUNNER_TEMP/remote-workspace" .
-          tar -czf "$RUNNER_TEMP/opencode-data.tar.gz" \
-            -C "$RUNNER_TEMP/remote-opencode-data" .
-          tar -czf "$RUNNER_TEMP/fcm-data.tar.gz" \
-            -C "$RUNNER_TEMP/remote-fcm-data" .
-
-          echo "created=true" >> "$GITHUB_OUTPUT"
-
-      - name: Upload Remote Tool State Artifact
-        if: always() && steps.snapshot.outputs.created == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: opencode-remote-state
-          path: |
-            ${{ runner.temp }}/workspace.tar.gz
-            ${{ runner.temp }}/opencode-data.tar.gz
-            ${{ runner.temp }}/fcm-data.tar.gz
-          if-no-files-found: error
-          retention-days: 30
-          compression-level: 0
-
-      - name: Cleanup Remote Container
-        if: always()
-        run: |
-          docker rm -f opencode-remote 2>/dev/null || true
-          echo "OpenCode container removed."
+          docker rm -f opencode-wrap-remote 2>/dev/null || true
+          echo "OpenCode Wrap container removed."
