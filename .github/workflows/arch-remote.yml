@@ -134,6 +134,7 @@ jobs:
           path: ${{ runner.temp }}/workspace-restore
 
       - name: Restore Previous Workspace
+        id: restore
         if: steps.previous.outputs.artifact_id != ''
         env:
           SOURCE_RUN_ID: ${{ steps.previous.outputs.run_id }}
@@ -696,7 +697,9 @@ jobs:
 
       - name: Create Workspace Snapshot
         id: snapshot
-        if: always()
+        # Do not write a blank/new snapshot when a selected artifact failed to
+        # download or restore. Preserve the last good artifact instead.
+        if: always() && (steps.previous.outputs.artifact_id == '' || steps.restore.outcome == 'success')
         run: |
           set -euo pipefail
           if [ ! -d "$RUNNER_TEMP/remote-workspace" ]; then
