@@ -211,15 +211,15 @@ jobs:
           fi
 
           if [ -f "$RESTORE_DIR/workspace.tar.gz" ]; then
-            tar -xzf "$RUNNER_TEMP/workspace-restore/workspace.tar.gz" \
+            tar -xzf "$RESTORE_DIR/workspace.tar.gz" \
               -C "$RUNNER_TEMP/remote-workspace"
             echo "Previous workspace restored."
           else
             echo "No workspace archive was present in the downloaded artifact."
           fi
 
-          if [ -f "$RUNNER_TEMP/workspace-restore/opencode-data.tar.gz" ]; then
-            tar -xzf "$RUNNER_TEMP/workspace-restore/opencode-data.tar.gz" \
+          if [ -f "$RESTORE_DIR/opencode-data.tar.gz" ]; then
+            tar -xzf "$RESTORE_DIR/opencode-data.tar.gz" \
               -C "$RUNNER_TEMP/remote-opencode-data"
             echo "Previous OpenCode user data restored."
           else
@@ -227,7 +227,7 @@ jobs:
           fi
 
           for state in claude-data herdr-config cargo-home rustup-home; do
-            archive="$RUNNER_TEMP/workspace-restore/$state.tar.gz"
+            archive="$RESTORE_DIR/$state.tar.gz"
             case "$state" in
               claude-data) target="$RUNNER_TEMP/remote-claude-data" ;;
               herdr-config) target="$RUNNER_TEMP/remote-herdr-config" ;;
