@@ -153,7 +153,9 @@ jobs:
           echo "Artifact created at: $SOURCE_ARTIFACT_CREATED_AT"
           echo "Source commit: $SOURCE_HEAD_SHA"
 
-          RESTORE_DIR="$RUNNER_TEMP/workspace-restore"
+          # download-artifact@v4 places a single artifact selected by ID
+          # inside a subdirectory named after that artifact.
+          RESTORE_DIR="$RUNNER_TEMP/workspace-restore/$SOURCE_ARTIFACT_NAME"
           test -s "$RESTORE_DIR/workspace.tar.gz" || {
             echo "::error::Selected snapshot artifact is missing workspace.tar.gz."
             exit 1
