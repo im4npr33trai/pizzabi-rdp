@@ -25,37 +25,91 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const runs = await github.rest.actions.listWorkflowRuns({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: "arch-remote.yml",
-              branch: "Singh",
-              status: "completed",
-              per_page: 50
-            });
+            // Build a lookup of completed runs belonging to this workflow and
+            // the branch selected when this workflow was dispatched.
+            const workflowRuns = new Map();
 
-            for (const run of runs.data.workflow_runs) {
-              if (run.id === context.runId) continue;
-
-              const response = await github.rest.actions.listWorkflowRunArtifacts({
+            for (let page = 1; page <= 5; page++) {
+              const response = await github.rest.actions.listWorkflowRuns({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                run_id: run.id
+                workflow_id: "arch-remote.yml",
+                branch: context.ref_name,
+                status: "completed",
+                sort: "created",
+                direction: "desc",
+                per_page: 100,
+                page
               });
 
-              const artifact = response.data.artifacts.find(
-                item => item.name === "linux-remote-workspace" && !item.expired
-              );
-
-              if (artifact) {
-                core.setOutput("run_id", String(run.id));
-                console.log("Found workspace snapshot from run:", run.id);
-                return;
+              for (const run of response.data.workflow_runs) {
+                if (String(run.id) !== String(context.runId)) {
+                  workflowRuns.set(String(run.id), run);
+                }
               }
+
+              if (response.data.workflow_runs.length < 100) break;
             }
 
-            core.setOutput("run_id", "");
-            console.log("No previous workspace snapshot found.");
+            // Repository-wide artifact listing exposes each artifact's
+            // originating workflow run, allowing us to select by the actual
+            // artifact timestamp instead of guessing from run ordering.
+            const candidates = [];
+
+            for (let page = 1; page <= 5; page++) {
+              const response = await github.rest.actions.listArtifactsForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: "linux-remote-workspace",
+                per_page: 100,
+                page
+              });
+
+              for (const artifact of response.data.artifacts) {
+                if (artifact.expired === true || !artifact.created_at) continue;
+
+                const sourceRunId = String(artifact.workflow_run?.id || "");
+                const sourceRun = workflowRuns.get(sourceRunId);
+                if (!sourceRun) continue;
+
+                if (artifact.workflow_run?.head_branch !== context.ref_name) continue;
+
+                candidates.push({ artifact, run: sourceRun });
+              }
+
+              if (response.data.artifacts.length < 100) break;
+            }
+
+            candidates.sort((a, b) =>
+              Date.parse(b.artifact.created_at) - Date.parse(a.artifact.created_at)
+            );
+
+            const newest = candidates[0];
+
+            if (newest) {
+              const { run, artifact } = newest;
+              core.setOutput("run_id", String(run.id));
+              core.setOutput("artifact_id", String(artifact.id));
+              core.setOutput("artifact_created_at", artifact.created_at);
+              core.setOutput("run_number", String(run.run_number));
+              core.setOutput("head_sha", run.head_sha || "");
+              core.setOutput("head_branch", run.head_branch || "");
+
+              core.notice(
+                "Selected newest workspace artifact ID " + artifact.id +
+                " from arch-remote.yml run #" + run.run_number +
+                " (run ID " + run.id + "), created at " +
+                artifact.created_at + ", commit " + (run.head_sha || "unknown")
+              );
+            } else {
+              core.setOutput("run_id", "");
+              core.setOutput("artifact_id", "");
+              core.notice(
+                "No unexpired linux-remote-workspace artifact was found for " +
+                "arch-remote.yml on branch " + context.ref_name +
+                "; this session will start with an empty workspace."
+              );
+            }
 
       - name: Prepare Persistent Directories
         run: |
@@ -67,20 +121,80 @@ jobs:
           mkdir -p "$RUNNER_TEMP/remote-cargo-home"
           mkdir -p "$RUNNER_TEMP/remote-rustup-home"
 
-      - name: Download Previous Workspace
-        if: steps.previous.outputs.run_id != ''
+      - name: Download Exact Previous Workspace Artifact
+        if: steps.previous.outputs.artifact_id != ''
         uses: actions/download-artifact@v4
         with:
-          name: linux-remote-workspace
+          artifact-ids: ${{ steps.previous.outputs.artifact_id }}
           repository: ${{ github.repository }}
           run-id: ${{ steps.previous.outputs.run_id }}
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/workspace-restore
 
       - name: Restore Previous Workspace
-        if: steps.previous.outputs.run_id != ''
+        if: steps.previous.outputs.artifact_id != ''
+        env:
+          SOURCE_RUN_ID: ${{ steps.previous.outputs.run_id }}
+          SOURCE_RUN_NUMBER: ${{ steps.previous.outputs.run_number }}
+          SOURCE_ARTIFACT_ID: ${{ steps.previous.outputs.artifact_id }}
+          SOURCE_ARTIFACT_CREATED_AT: ${{ steps.previous.outputs.artifact_created_at }}
+          SOURCE_HEAD_SHA: ${{ steps.previous.outputs.head_sha }}
         run: |
-          if [ -f "$RUNNER_TEMP/workspace-restore/workspace.tar.gz" ]; then
+          set -euo pipefail
+
+          echo "Restoring exact artifact ID: $SOURCE_ARTIFACT_ID"
+          echo "Source workflow run: #$SOURCE_RUN_NUMBER (ID $SOURCE_RUN_ID)"
+          echo "Artifact created at: $SOURCE_ARTIFACT_CREATED_AT"
+          echo "Source commit: $SOURCE_HEAD_SHA"
+
+          RESTORE_DIR="$RUNNER_TEMP/workspace-restore"
+          test -s "$RESTORE_DIR/workspace.tar.gz" || {
+            echo "::error::Selected snapshot artifact is missing workspace.tar.gz."
+            exit 1
+          }
+          test -s "$RESTORE_DIR/opencode-data.tar.gz" || {
+            echo "::error::Selected snapshot artifact is missing opencode-data.tar.gz."
+            exit 1
+          }
+
+          # Verify every supplied archive before extracting anything. This
+          # prevents a partial restore from mixing old and new state.
+          for archive in "$RESTORE_DIR"/*.tar.gz; do
+            [ -e "$archive" ] || continue
+            tar -tzf "$archive" >/dev/null || {
+              echo "::error::Snapshot archive is corrupt: $archive"
+              exit 1
+            }
+          done
+
+          if [ -f "$RESTORE_DIR/snapshot-manifest.json" ]; then
+            python3 - "$RESTORE_DIR/snapshot-manifest.json" "$SOURCE_RUN_ID" <<'PY'
+          import json
+          import sys
+
+          manifest_path, expected_run_id = sys.argv[1:3]
+          with open(manifest_path, encoding="utf-8") as handle:
+              manifest = json.load(handle)
+
+          actual_run_id = str(manifest.get("run_id", ""))
+          if actual_run_id != expected_run_id:
+              raise SystemExit(
+                  f"Snapshot manifest run ID {actual_run_id!r} does not match "
+                  f"selected run ID {expected_run_id!r}"
+              )
+
+          print(
+              "Snapshot manifest verified:",
+              f"run #{manifest.get('run_number', 'unknown')},",
+              f"commit {manifest.get('sha', 'unknown')},",
+              f"created {manifest.get('created_at', 'unknown')}",
+          )
+          PY
+          else
+            echo "Legacy snapshot detected (created before snapshot manifests were added)."
+          fi
+
+          if [ -f "$RESTORE_DIR/workspace.tar.gz" ]; then
             tar -xzf "$RUNNER_TEMP/workspace-restore/workspace.tar.gz" \
               -C "$RUNNER_TEMP/remote-workspace"
             echo "Previous workspace restored."
@@ -604,6 +718,18 @@ jobs:
           tar -czf "$RUNNER_TEMP/rustup-home.tar.gz" \
             -C "$RUNNER_TEMP/remote-rustup-home" .
 
+          cat > "$RUNNER_TEMP/snapshot-manifest.json" <<EOF
+          {
+            "artifact_name": "linux-remote-workspace",
+            "run_id": "$GITHUB_RUN_ID",
+            "run_number": "$GITHUB_RUN_NUMBER",
+            "run_attempt": "$GITHUB_RUN_ATTEMPT",
+            "sha": "$GITHUB_SHA",
+            "ref": "$GITHUB_REF",
+            "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
           echo "created=true" >> "$GITHUB_OUTPUT"
 
       - name: Upload Workspace Artifact
@@ -618,6 +744,7 @@ jobs:
             ${{ runner.temp }}/herdr-config.tar.gz
             ${{ runner.temp }}/cargo-home.tar.gz
             ${{ runner.temp }}/rustup-home.tar.gz
+            ${{ runner.temp }}/snapshot-manifest.json
           if-no-files-found: error
           retention-days: 30
           compression-level: 3
