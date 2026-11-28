@@ -27,91 +27,91 @@ jobs:
           TARGET_BRANCH: ${{ github.ref_name }}
         with:
           script: |
-            // Build a lookup of completed runs belonging to this workflow and
-            // the branch selected when this workflow was dispatched.
-            const workflowRuns = new Map();
+            const runsResponse = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "arch-remote.yml",
+              branch: process.env.TARGET_BRANCH,
+              status: "completed",
+              sort: "created",
+              direction: "desc",
+              per_page: 100
+            });
 
-            for (let page = 1; page <= 5; page++) {
-              const response = await github.rest.actions.listWorkflowRuns({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                workflow_id: "arch-remote.yml",
-                branch: process.env.TARGET_BRANCH,
-                status: "completed",
-                sort: "created",
-                direction: "desc",
-                per_page: 100,
-                page
-              });
-
-              for (const run of response.data.workflow_runs) {
-                if (String(run.id) !== String(context.runId)) {
-                  workflowRuns.set(String(run.id), run);
-                }
-              }
-
-              if (response.data.workflow_runs.length < 100) break;
-            }
-
-            // Repository-wide artifact listing exposes each artifact's
-            // originating workflow run, allowing us to select by the actual
-            // artifact timestamp instead of guessing from run ordering.
-            const candidates = [];
-
-            for (let page = 1; page <= 5; page++) {
-              const response = await github.rest.actions.listArtifactsForRepo({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                name: "linux-remote-workspace",
-                per_page: 100,
-                page
-              });
-
-              for (const artifact of response.data.artifacts) {
-                if (artifact.expired === true || !artifact.created_at) continue;
-
-                const sourceRunId = String(artifact.workflow_run?.id || "");
-                const sourceRun = workflowRuns.get(sourceRunId);
-                if (!sourceRun) continue;
-
-                if (artifact.workflow_run?.head_branch !== process.env.TARGET_BRANCH) continue;
-
-                candidates.push({ artifact, run: sourceRun });
-              }
-
-              if (response.data.artifacts.length < 100) break;
-            }
-
-            candidates.sort((a, b) =>
-              Date.parse(b.artifact.created_at) - Date.parse(a.artifact.created_at)
+            // Only inspect the immediately previous completed runner session.
+            // Do not silently fall back to an older artifact if this run did
+            // not produce one; that is how stale workspaces get resurrected.
+            const latestRun = runsResponse.data.workflow_runs.find(
+              run => String(run.id) !== String(context.runId)
             );
 
-            const newest = candidates[0];
-
-            if (newest) {
-              const { run, artifact } = newest;
-              core.setOutput("run_id", String(run.id));
-              core.setOutput("artifact_id", String(artifact.id));
-              core.setOutput("artifact_created_at", artifact.created_at);
-              core.setOutput("run_number", String(run.run_number));
-              core.setOutput("head_sha", run.head_sha || "");
-              core.setOutput("head_branch", run.head_branch || "");
-
-              core.notice(
-                "Selected newest workspace artifact ID " + artifact.id +
-                " from arch-remote.yml run #" + run.run_number +
-                " (run ID " + run.id + "), created at " +
-                artifact.created_at + ", commit " + (run.head_sha || "unknown")
-              );
-            } else {
+            if (!latestRun) {
               core.setOutput("run_id", "");
               core.setOutput("artifact_id", "");
-              core.notice(
-                "No unexpired linux-remote-workspace artifact was found for " +
-                "arch-remote.yml on branch " + process.env.TARGET_BRANCH +
-                "; this session will start with an empty workspace."
-              );
+              core.notice("No previous completed arch-remote.yml run exists on this branch.");
+              return;
             }
+
+            const attempt = Number(latestRun.run_attempt || 1);
+            const expectedName =
+              "linux-remote-workspace-" + latestRun.id + "-" + attempt;
+
+            const artifactsResponse = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: latestRun.id,
+              per_page: 100
+            });
+
+            const usable = artifactsResponse.data.artifacts.filter(
+              item => item.expired !== true
+            );
+
+            // New artifacts are unique to run ID + attempt. Accept the old
+            // fixed name only for legacy first-attempt runs created before
+            // unique naming was introduced.
+            let artifact = usable
+              .filter(item => item.name === expectedName)
+              .sort((a, b) =>
+                Date.parse(b.created_at) - Date.parse(a.created_at)
+              )[0];
+
+            if (!artifact && attempt === 1) {
+              artifact = usable
+                .filter(item => item.name === "linux-remote-workspace")
+                .sort((a, b) =>
+                  Date.parse(b.created_at) - Date.parse(a.created_at)
+                )[0];
+            }
+
+            if (!artifact) {
+              core.setOutput("run_id", "");
+              core.setOutput("artifact_id", "");
+              core.warning(
+                "The immediately previous completed runner session #" +
+                latestRun.run_number + " (run ID " + latestRun.id +
+                ", attempt " + attempt + ") has no unexpired workspace artifact. " +
+                "Older artifacts will NOT be restored."
+              );
+              return;
+            }
+
+            core.setOutput("run_id", String(latestRun.id));
+            core.setOutput("artifact_id", String(artifact.id));
+            core.setOutput("artifact_name", artifact.name);
+            core.setOutput("artifact_created_at", artifact.created_at);
+            core.setOutput("run_number", String(latestRun.run_number));
+            core.setOutput("run_attempt", String(attempt));
+            core.setOutput("head_sha", latestRun.head_sha || "");
+            core.setOutput("head_branch", latestRun.head_branch || "");
+
+            core.notice(
+              "Selected exact previous-session artifact " + artifact.name +
+              " (artifact ID " + artifact.id + ") from run #" +
+              latestRun.run_number + ", attempt " + attempt +
+              ", created at " + artifact.created_at +
+              ", commit " + (latestRun.head_sha || "unknown")
+            );
 
       - name: Prepare Persistent Directories
         run: |
@@ -139,13 +139,16 @@ jobs:
           SOURCE_RUN_ID: ${{ steps.previous.outputs.run_id }}
           SOURCE_RUN_NUMBER: ${{ steps.previous.outputs.run_number }}
           SOURCE_ARTIFACT_ID: ${{ steps.previous.outputs.artifact_id }}
+          SOURCE_ARTIFACT_NAME: ${{ steps.previous.outputs.artifact_name }}
           SOURCE_ARTIFACT_CREATED_AT: ${{ steps.previous.outputs.artifact_created_at }}
+          SOURCE_RUN_ATTEMPT: ${{ steps.previous.outputs.run_attempt }}
           SOURCE_HEAD_SHA: ${{ steps.previous.outputs.head_sha }}
         run: |
           set -euo pipefail
 
-          echo "Restoring exact artifact ID: $SOURCE_ARTIFACT_ID"
-          echo "Source workflow run: #$SOURCE_RUN_NUMBER (ID $SOURCE_RUN_ID)"
+          echo "Restoring exact artifact: $SOURCE_ARTIFACT_NAME"
+          echo "Artifact ID: $SOURCE_ARTIFACT_ID"
+          echo "Source workflow run: #$SOURCE_RUN_NUMBER (ID $SOURCE_RUN_ID, attempt $SOURCE_RUN_ATTEMPT)"
           echo "Artifact created at: $SOURCE_ARTIFACT_CREATED_AT"
           echo "Source commit: $SOURCE_HEAD_SHA"
 
@@ -170,19 +173,27 @@ jobs:
           done
 
           if [ -f "$RESTORE_DIR/snapshot-manifest.json" ]; then
-            python3 - "$RESTORE_DIR/snapshot-manifest.json" "$SOURCE_RUN_ID" <<'PY'
+            python3 - "$RESTORE_DIR/snapshot-manifest.json" "$SOURCE_RUN_ID" "$SOURCE_ARTIFACT_NAME" <<'PY'
           import json
           import sys
 
-          manifest_path, expected_run_id = sys.argv[1:3]
+          manifest_path, expected_run_id, expected_artifact_name = sys.argv[1:4]
           with open(manifest_path, encoding="utf-8") as handle:
               manifest = json.load(handle)
 
           actual_run_id = str(manifest.get("run_id", ""))
+          actual_artifact_name = str(manifest.get("artifact_name", ""))
+
           if actual_run_id != expected_run_id:
               raise SystemExit(
                   f"Snapshot manifest run ID {actual_run_id!r} does not match "
                   f"selected run ID {expected_run_id!r}"
+              )
+
+          if actual_artifact_name != expected_artifact_name:
+              raise SystemExit(
+                  f"Snapshot manifest artifact name {actual_artifact_name!r} "
+                  f"does not match selected artifact {expected_artifact_name!r}"
               )
 
           print(
@@ -722,7 +733,7 @@ jobs:
 
           cat > "$RUNNER_TEMP/snapshot-manifest.json" <<EOF
           {
-            "artifact_name": "linux-remote-workspace",
+            "artifact_name": "linux-remote-workspace-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT",
             "run_id": "$GITHUB_RUN_ID",
             "run_number": "$GITHUB_RUN_NUMBER",
             "run_attempt": "$GITHUB_RUN_ATTEMPT",
@@ -738,7 +749,7 @@ jobs:
         if: always() && steps.snapshot.outputs.created == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: linux-remote-workspace
+          name: linux-remote-workspace-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/workspace.tar.gz
             ${{ runner.temp }}/opencode-data.tar.gz
