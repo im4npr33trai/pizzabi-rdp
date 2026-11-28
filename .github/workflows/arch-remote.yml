@@ -59,8 +59,13 @@ jobs:
 
       - name: Prepare Persistent Directories
         run: |
+          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/remote-workspace"
           mkdir -p "$RUNNER_TEMP/remote-opencode-data"
+          mkdir -p "$RUNNER_TEMP/remote-claude-data"
+          mkdir -p "$RUNNER_TEMP/remote-herdr-config"
+          mkdir -p "$RUNNER_TEMP/remote-cargo-home"
+          mkdir -p "$RUNNER_TEMP/remote-rustup-home"
 
       - name: Download Previous Workspace
         if: steps.previous.outputs.run_id != ''
@@ -84,13 +89,29 @@ jobs:
           fi
 
           if [ -f "$RUNNER_TEMP/workspace-restore/opencode-data.tar.gz" ]; then
-            mkdir -p "$RUNNER_TEMP/remote-opencode-data"
             tar -xzf "$RUNNER_TEMP/workspace-restore/opencode-data.tar.gz" \
               -C "$RUNNER_TEMP/remote-opencode-data"
             echo "Previous OpenCode user data restored."
           else
             echo "No previous OpenCode data archive found; starting with an empty OpenCode data directory."
           fi
+
+          for state in claude-data herdr-config cargo-home rustup-home; do
+            archive="$RUNNER_TEMP/workspace-restore/$state.tar.gz"
+            case "$state" in
+              claude-data) target="$RUNNER_TEMP/remote-claude-data" ;;
+              herdr-config) target="$RUNNER_TEMP/remote-herdr-config" ;;
+              cargo-home) target="$RUNNER_TEMP/remote-cargo-home" ;;
+              rustup-home) target="$RUNNER_TEMP/remote-rustup-home" ;;
+            esac
+
+            if [ -f "$archive" ]; then
+              tar -xzf "$archive" -C "$target"
+              echo "Restored $state."
+            else
+              echo "No previous $state archive found; starting fresh."
+            fi
+          done
 
       - name: Connect to Tailscale
         uses: tailscale/github-action@v4
@@ -118,6 +139,10 @@ jobs:
             --restart=no
             --volume "$RUNNER_TEMP/remote-workspace:/workspace"
             --volume "$RUNNER_TEMP/remote-opencode-data:/home/remote/.local/share/opencode"
+            --volume "$RUNNER_TEMP/remote-claude-data:/claude-data"
+            --volume "$RUNNER_TEMP/remote-herdr-config:/herdr-config"
+            --volume "$RUNNER_TEMP/remote-cargo-home:/cargo-home"
+            --volume "$RUNNER_TEMP/remote-rustup-home:/rustup-home"
           )
 
           # Expose the host Docker daemon when the runner provides its socket.
@@ -183,8 +208,20 @@ jobs:
           chmod 0440 /etc/sudoers.d/remote
           visudo -cf /etc/sudoers.d/remote
 
-          mkdir -p /run/sshd /workspace /home/remote/.ssh /home/remote/Downloads /home/remote/Projects /home/remote/.local/bin
-          chown -R remote:remote /workspace /home/remote
+          mkdir -p /run/sshd /workspace /home/remote/.ssh \
+            /home/remote/Downloads /home/remote/Projects /home/remote/.local/bin \
+            /home/remote/.local/share /home/remote/.config \
+            /claude-data /herdr-config /cargo-home /rustup-home
+          chown -R remote:remote /workspace /home/remote \
+            /claude-data /herdr-config /cargo-home /rustup-home
+
+          # Persist Claude settings, Herdr configuration, Cargo-installed tools,
+          # and Rust toolchains outside the ephemeral container filesystem.
+          ln -sfn /claude-data /home/remote/.claude
+          ln -sfn /herdr-config /home/remote/.config/herdr
+          ln -sfn /cargo-home /home/remote/.cargo
+          ln -sfn /rustup-home /home/remote/.rustup
+
           chmod 700 /home/remote/.ssh
           ssh-keygen -A
 
@@ -264,7 +301,7 @@ jobs:
           export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
           export ANDROID_HOME=/home/remote/Android/Sdk
           export ANDROID_SDK_ROOT="$ANDROID_HOME"
-          export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$JAVA_HOME/bin:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$HOME/.opencode/bin:$JAVA_HOME/bin:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
           ANDROID_ENV
           chmod 644 /etc/profile.d/remote-android.sh
           chown -R remote:remote /home/remote/Android
@@ -415,6 +452,11 @@ jobs:
           echo "Username:     remote"
           echo "Workspace:    /workspace"
           echo "OpenCode data: /home/remote/.local/share/opencode (persisted)"
+          echo "Claude config: /home/remote/.claude (credentials excluded from artifact)"
+          echo "Herdr config:  /home/remote/.config/herdr (persisted)"
+          echo "Cargo tools:   /home/remote/.cargo/bin (persisted)"
+          echo "Rust toolchain:/home/remote/.rustup (persisted)"
+          echo "Generated workspace build folders are removed before snapshot."
           echo
           echo "SSH:"
           echo "ssh -p 2222 remote@$TS_IP"
@@ -436,6 +478,52 @@ jobs:
             sleep 300
           done
 
+      - name: Cleanup Generated Workspace and Cargo Build Caches
+        if: always()
+        run: |
+          set -uo pipefail
+
+          WORKSPACE="$RUNNER_TEMP/remote-workspace"
+          if [ -d "$WORKSPACE" ]; then
+            echo "Removing generated build and dependency directories from workspace..."
+            find "$WORKSPACE" -type d \\( \
+              -name node_modules -o \
+              -name target -o \
+              -name .next -o \
+              -name .turbo -o \
+              -name .cache -o \
+              -name .parcel-cache -o \
+              -name .vite -o \
+              -name .svelte-kit -o \
+              -name .angular -o \
+              -name .gradle -o \
+              -name .dart_tool -o \
+              -name coverage -o \
+              -name dist -o \
+              -name build -o \
+              -name out -o \
+              -name __pycache__ -o \
+              -name .pytest_cache -o \
+              -name .mypy_cache -o \
+              -name .ruff_cache -o \
+              -name .venv -o \
+              -name venv -o \
+              -name CMakeFiles -o \
+              -name cmake-build-debug -o \
+              -name cmake-build-release \
+            \\) -prune -print -exec rm -rf -- {} + || true
+
+            find "$WORKSPACE" -type f \\( -name '*.pyc' -o -name '*.pyo' \\) \
+              -print -delete || true
+          fi
+
+          # Cargo-installed executables and metadata live in ~/.cargo/bin and
+          # ~/.cargo/.crates*. Remove only regenerable download/build caches.
+          rm -rf "$RUNNER_TEMP/remote-cargo-home/registry" \
+            "$RUNNER_TEMP/remote-cargo-home/git" || true
+
+          echo "Generated build outputs cleaned; source files and tool installations retained."
+
       - name: Create Workspace Snapshot
         id: snapshot
         if: always()
@@ -445,9 +533,34 @@ jobs:
             echo "created=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          tar -czf "$RUNNER_TEMP/workspace.tar.gz" -C "$RUNNER_TEMP/remote-workspace" .
-          mkdir -p "$RUNNER_TEMP/remote-opencode-data"
-          tar -czf "$RUNNER_TEMP/opencode-data.tar.gz" -C "$RUNNER_TEMP/remote-opencode-data" .
+          tar -czf "$RUNNER_TEMP/workspace.tar.gz" \
+            -C "$RUNNER_TEMP/remote-workspace" .
+
+          tar -czf "$RUNNER_TEMP/opencode-data.tar.gz" \
+            -C "$RUNNER_TEMP/remote-opencode-data" .
+
+          # Claude settings, plugins, agents and commands persist, but never
+          # store the Linux Claude login token in a GitHub Actions artifact.
+          tar --exclude='./.credentials.json' \
+            --exclude='.credentials.json' \
+            --exclude='*/.credentials.json' \
+            -czf "$RUNNER_TEMP/claude-data.tar.gz" \
+            -C "$RUNNER_TEMP/remote-claude-data" .
+
+          tar -czf "$RUNNER_TEMP/herdr-config.tar.gz" \
+            -C "$RUNNER_TEMP/remote-herdr-config" .
+
+          # Preserve Cargo-installed binaries and metadata, excluding registry
+          # credentials should a private registry have been configured.
+          tar --exclude='./credentials.toml' \
+            --exclude='credentials.toml' \
+            --exclude='*/credentials.toml' \
+            -czf "$RUNNER_TEMP/cargo-home.tar.gz" \
+            -C "$RUNNER_TEMP/remote-cargo-home" .
+
+          tar -czf "$RUNNER_TEMP/rustup-home.tar.gz" \
+            -C "$RUNNER_TEMP/remote-rustup-home" .
+
           echo "created=true" >> "$GITHUB_OUTPUT"
 
       - name: Upload Workspace Artifact
@@ -458,9 +571,13 @@ jobs:
           path: |
             ${{ runner.temp }}/workspace.tar.gz
             ${{ runner.temp }}/opencode-data.tar.gz
+            ${{ runner.temp }}/claude-data.tar.gz
+            ${{ runner.temp }}/herdr-config.tar.gz
+            ${{ runner.temp }}/cargo-home.tar.gz
+            ${{ runner.temp }}/rustup-home.tar.gz
           if-no-files-found: error
           retention-days: 30
-          compression-level: 0
+          compression-level: 3
 
       - name: Cleanup Ubuntu Container
         if: always()
