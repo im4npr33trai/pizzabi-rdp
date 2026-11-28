@@ -500,7 +500,7 @@ jobs:
 
           if [ -d "$WORKSPACE" ]; then
             echo "Removing generated build and dependency directories..."
-            find "$WORKSPACE" -type d \\( \
+            find "$WORKSPACE" -type d \( \
               -name node_modules -o \
               -name target -o \
               -name .next -o \
@@ -525,9 +525,9 @@ jobs:
               -name CMakeFiles -o \
               -name cmake-build-debug -o \
               -name cmake-build-release \
-            \\) -prune -print -exec rm -rf -- {} + || true
+            \) -prune -print -exec rm -rf -- {} + || true
 
-            find "$WORKSPACE" -type f \\( -name '*.pyc' -o -name '*.pyo' \\) \
+            find "$WORKSPACE" -type f \( -name '*.pyc' -o -name '*.pyo' \) \
               -print -delete || true
           fi
 
@@ -544,7 +544,7 @@ jobs:
           else
             echo "Container is unavailable; attempting host-side cleanup."
             WORKSPACE="$RUNNER_TEMP/remote-workspace"
-            sudo find "$WORKSPACE" -type d \\( \
+            sudo find "$WORKSPACE" -type d \( \
               -name node_modules -o -name target -o -name .next -o -name .turbo \
               -o -name .cache -o -name .parcel-cache -o -name .vite \
               -o -name .svelte-kit -o -name .angular -o -name .gradle \
@@ -553,7 +553,7 @@ jobs:
               -o -name .mypy_cache -o -name .ruff_cache -o -name .venv \
               -o -name venv -o -name CMakeFiles -o -name cmake-build-debug \
               -o -name cmake-build-release \
-            \\) -prune -print -exec rm -rf -- {} + || true
+            \) -prune -print -exec rm -rf -- {} + || true
             sudo rm -rf "$RUNNER_TEMP/remote-cargo-home/registry" \
               "$RUNNER_TEMP/remote-cargo-home/git" || true
             sudo chown -R "$HOST_UID:$HOST_GID" \
